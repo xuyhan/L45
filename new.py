@@ -503,13 +503,13 @@ class CustomDataset:
         return len(self.instances)
 
 
-def make_data(name, size):
+def make_data(name, envs, size):
     dataset = CustomDataset()
     pbar = tqdm(range(size))
-    env = Scatter2D(10, 10)
 
     for _ in pbar:
-        dataset.add_example(*env.rgg(force_path=True))
+        for env in envs:
+            dataset.add_example(*env.rgg(force_path=True))
         pbar.set_postfix_str(f'Generating RGGs')
 
     file = open(f'objs/{name}.pkl', 'wb')
@@ -714,14 +714,11 @@ if __name__ == '__main__':
 
     env_train = Scatter2D(10, 10, map=world_basic)
     env_checker = Scatter2D(10, 10, map=world_checker)
+    env_corridor = Scatter2D(10, 10, map=world_corridor)
+    env_x = Scatter2D(10, 10, map=world_x)
+    env_scatter = Scatter2D(10, 10, map=world_scatter)
 
-    evaluate(env_checker, model1, n_instances=100, seed=123)
-    #evaluate(env_hard, model2, n_instances=100, seed=123)
+    make_data('checker_corridor', [env_checker, env_corridor], 500)
 
+    train('objs/train_fixed_start_end.pkl', 'model_checker_corridor')
 
-    evaluate_baseline(env_checker, n_instances=100, seed=123)
-    #evaluate(env, model, 'objs/test_random_start_end.pkl')
-    #train('objs/train_fixed_start_end.pkl', 'model_fixed')
-    #train('objs/train_random_start_end.pkl', 'model_random')
-
-    #
