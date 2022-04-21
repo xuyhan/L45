@@ -16,8 +16,8 @@ import heapq
 import pickle
 
 TAU = 50
-N_SAMPLES = 800
-K = 8
+N_SAMPLES = 300
+K = 5
 BATCH_SIZE = 32
 N_OBSTACLES = 6
 
@@ -412,16 +412,21 @@ def evaluate(env, model, n_instances, seed):
     start_end = env.start_end_seeded(n_instances, s=seed)
 
     for se in tqdm(start_end):
-        time_start = time.process_time()
+        time_start = time.time()
 
         success = False
+        tries = 0
 
-        while not success:
+        while not success and tries < 3:
             graph = env._rgg(se)
             E = model(graph.x, graph.edge_index).squeeze()  # [n_nodes, n_nodes]
             tree_nodes, tree_edges, frontier, success, steps = helper(E, env, graph, 1000)
+            tries += 1
 
-        env.visualise(graph, special_edges=tree_edges, frontier_edges=frontier)
+        if not success:
+            continue
+
+        #env.visualise(graph, special_edges=tree_edges, frontier_edges=frontier)
 
         adj_list = defaultdict(list)
         nodes = set()
@@ -433,7 +438,7 @@ def evaluate(env, model, n_instances, seed):
         assert path != []
         success_count += 1
         path_cost_total += distance
-        running_time_total += time.process_time() - time_start
+        running_time_total += time.time() - time_start
 
     print(f'Success rate: {success_count / n_instances : .3f}')
     print(f'Average time: {running_time_total / success_count : .3f}')
@@ -448,7 +453,7 @@ def evaluate_baseline(env, n_instances, seed):
     start_end = env.start_end_seeded(n_instances, s=seed)
 
     for se in tqdm(start_end):
-        time_start = time.process_time()
+        time_start = time.time()
 
         _, graph, adj_list, costs, opt_path, dist, prev = env.rgg(force_path=True, start_end=se)
 
@@ -456,7 +461,7 @@ def evaluate_baseline(env, n_instances, seed):
             success_count += 1
         
         path_cost_total += dist[graph.x.shape[0] - 2]
-        running_time_total += time.process_time() - time_start
+        running_time_total += time.time() - time_start
 
     print(f'Success rate: {success_count / n_instances : .3f}')
     print(f'Average time: {running_time_total / success_count : .3f}')
@@ -469,11 +474,11 @@ def evaluate_rrt(env, n_instances, seed):
     path_cost_total = 0
 
     start_end = env.start_end_seeded(n_instances, s=seed)
-    max_iters = 1000
-    eps = 0.1
+    max_iters = 2000
+    eps = 0.5
 
     for se in tqdm(start_end):
-        time_start = time.process_time()
+        time_start = time.time()
 
         start_pos = np.array(se[0])
         end_pos = np.array(se[1])
@@ -506,7 +511,7 @@ def evaluate_rrt(env, n_instances, seed):
                 new_node = nodes[-1] + 1
                 nodes.append(new_node)
                 positions.append(end_pos)
-                adj_list[new_node].append(new_node_pos)
+                adj_list[new_node].append(new_node - 1)
                 success = True
 
             if success:
@@ -515,11 +520,11 @@ def evaluate_rrt(env, n_instances, seed):
         if not success:
             continue
 
-        path, distance = tree_to_path(adj_list, set(nodes), pos=positions, src=0, dst=new_node)
+        path, distance = tree_to_path(adj_list, set(nodes), pos=torch.tensor(positions), src=0, dst=new_node)
         assert path != []
         success_count += 1
         path_cost_total += distance
-        running_time_total += time.process_time() - time_start
+        running_time_total += time.time() - time_start
 
     print(f'Success rate: {success_count / n_instances : .3f}')
     print(f'Average time: {running_time_total / success_count : .3f}')
@@ -737,8 +742,9 @@ if __name__ == '__main__':
     env_x = Scatter2D(10, 10, map=world_x)
     env_scatter = Scatter2D(10, 10, map=world_scatter)
 
-    #evaluate(env_corridor, model1, 100, 123)
-
-    make_data('checker_corridor', [env_checker, env_corridor], 500)
-    train('objs/checker_corridor.pkl', 'model_checker_corridor')
+    evaluate(env_checker, model1, 100, 123)
+    #evaluate_baseline(env_train, 100, 123)
+    evaluate_rrt(env_checker, 100, 123)
+    #make_data('checker_corridor', [env_checker, env_corridor], 500)
+    #train('objs/checker_corridor.pkl', 'model_checker_corridor')
 
