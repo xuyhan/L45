@@ -16,8 +16,8 @@ import heapq
 import pickle
 
 TAU = 50
-N_SAMPLES = 300
-K = 5
+N_SAMPLES = 800
+K = 8
 BATCH_SIZE = 32
 N_OBSTACLES = 6
 
@@ -170,13 +170,16 @@ class Env2D:
             ])
         return ret
 
+    def rand_position(self):
+        return torch.rand(2) * torch.tensor([self.width, self.height])
+
     def rgg(self, start_end=None, force_path=False):
         while True:
             graph = self._rgg(start_end=start_end)
             graph, adj_list, costs, opt_path, dist, prev = self.graph_properties(graph)
             if opt_path == [] and force_path:
                 continue
-            return graph, adj_list, costs, opt_path, dist, prev
+            return self, graph, adj_list, costs, opt_path, dist, prev
 
     def _rgg(self, start_end=None):
         rgg_size = self.n_samples + 2
@@ -375,13 +378,7 @@ def helper(E, env, graph, explore_steps, train_mode=False):
     return tree_nodes, tree_edges, frontier, success, steps
 
 
-def tree_to_path(tree_edges, pos, src, dst):
-    adj_list = defaultdict(list)
-    nodes = set()
-    for [u, v] in tree_edges.T:
-        adj_list[v.item()].append(u.item())   # need to revert edge directions in tree
-        nodes |= {u.item(), v.item()}
-
+def tree_to_path(adj_list, nodes, pos, src, dst):
     dist = {node: float('inf') for node in nodes}
     prev = {node: None for node in nodes}
 
@@ -424,9 +421,15 @@ def evaluate(env, model, n_instances, seed):
             E = model(graph.x, graph.edge_index).squeeze()  # [n_nodes, n_nodes]
             tree_nodes, tree_edges, frontier, success, steps = helper(E, env, graph, 1000)
 
-        #env.visualise(graph, special_edges=tree_edges, frontier_edges=frontier)
+        env.visualise(graph, special_edges=tree_edges, frontier_edges=frontier)
 
-        path, distance = tree_to_path(tree_edges, pos=graph.x[:, :2], src=graph.x.shape[0] - 2, dst=graph.x.shape[0] - 1)
+        adj_list = defaultdict(list)
+        nodes = set()
+        for [u, v] in tree_edges.T:
+            adj_list[v.item()].append(u.item())  # need to revert edge directions in tree
+            nodes |= {u.item(), v.item()}
+
+        path, distance = tree_to_path(adj_list, nodes, pos=graph.x[:, :2], src=graph.x.shape[0] - 2, dst=graph.x.shape[0] - 1)
         assert path != []
         success_count += 1
         path_cost_total += distance
@@ -447,7 +450,7 @@ def evaluate_baseline(env, n_instances, seed):
     for se in tqdm(start_end):
         time_start = time.process_time()
 
-        graph, adj_list, costs, opt_path, dist, prev = env.rgg(force_path=True, start_end=se)
+        _, graph, adj_list, costs, opt_path, dist, prev = env.rgg(force_path=True, start_end=se)
 
         if opt_path != []:
             success_count += 1
@@ -460,18 +463,75 @@ def evaluate_baseline(env, n_instances, seed):
     print(f'Average cost: {path_cost_total / success_count : .3f}')
 
 
+def evaluate_rrt(env, n_instances, seed):
+    success_count = 0
+    running_time_total = 0
+    path_cost_total = 0
+
+    start_end = env.start_end_seeded(n_instances, s=seed)
+    max_iters = 1000
+    eps = 0.1
+
+    for se in tqdm(start_end):
+        time_start = time.process_time()
+
+        start_pos = np.array(se[0])
+        end_pos = np.array(se[1])
+
+        adj_list = defaultdict(list)
+        positions = [start_pos]
+        nodes = [0]
+
+        success = False
+
+        for _ in range(max_iters):
+            rand_pos = env.rand_position().numpy()
+            nearest = min(nodes, key=lambda n: np.linalg.norm(positions[n] - rand_pos))
+            vec = rand_pos - positions[nearest]
+            norm = np.linalg.norm(vec)
+            unit = vec / norm
+            delta = min(eps, norm)
+            new_node_pos = positions[nearest] + delta * unit
+
+            if env.intersects(new_node_pos, positions[nearest]):
+                continue
+
+            new_node = nodes[-1] + 1
+            nodes.append(new_node)
+            positions.append(new_node_pos)
+
+            adj_list[new_node].append(nearest)
+
+            if np.linalg.norm(new_node_pos - end_pos) < eps:
+                new_node = nodes[-1] + 1
+                nodes.append(new_node)
+                positions.append(end_pos)
+                adj_list[new_node].append(new_node_pos)
+                success = True
+
+            if success:
+                break
+
+        if not success:
+            continue
+
+        path, distance = tree_to_path(adj_list, set(nodes), pos=positions, src=0, dst=new_node)
+        assert path != []
+        success_count += 1
+        path_cost_total += distance
+        running_time_total += time.process_time() - time_start
+
+    print(f'Success rate: {success_count / n_instances : .3f}')
+    print(f'Average time: {running_time_total / success_count : .3f}')
+    print(f'Average cost: {path_cost_total / success_count : .3f}')
 
 
-
-
-
-def test():
+def test(map):
     device = torch.device('cpu')
     model = Model(in_dim=6).to(device)
     model.load_state_dict(torch.load('models/model_random.pth'))
 
-    env = Scatter2D(10, 10)
-    graph, adj_list, costs, opt_path, dist, prev = env.rgg(force_path=True)
+    env, graph, adj_list, costs, opt_path, dist, prev = Scatter2D(10, 10, map=map).rgg(force_path=True)
 
     E = model(graph.x, graph.edge_index).squeeze()  # [n_nodes, n_nodes]
     tree_nodes, tree_edges, frontier, success, steps = helper(E, env, graph, 1000)
@@ -492,15 +552,23 @@ def test():
 class CustomDataset:
     def __init__(self):
         self.instances = []
+        self.env_mapping = {}
+        self.envs = []
 
-    def add_example(self, graph, adj_list, costs, opt_path, dist, prev):
+    def add_example(self, env, graph, adj_list, costs, opt_path, dist, prev):
         self.instances.append((graph, adj_list, costs, opt_path, dist, prev))
+        if env not in self.envs:
+            self.envs.append(env)
+        self.env_mapping[self.len() - 1] = self.envs.index(env)
 
     def get(self, i):
         return self.instances[i]
 
     def len(self):
         return len(self.instances)
+
+    def get_env(self, i):
+        return self.envs[self.env_mapping[i]]
 
 
 def make_data(name, envs, size):
@@ -520,8 +588,6 @@ def train(train_path, model_name):
     # device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     model = Model(in_dim=6)  # .to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-
-    env = Scatter2D(10, 10)
 
     file = open(train_path, 'rb')
     dataset = pickle.load(file)
@@ -545,6 +611,7 @@ def train(train_path, model_name):
 
             for instance in minibatch:
                 graph, adj_list, costs, opt_path, dist, prev = dataset.get(instance)
+                env = dataset.get_env(instance)
 
                 # start_time = time.process_time()
                 E = model(graph.x, graph.edge_index).squeeze()  # [n_nodes, n_nodes]
@@ -562,54 +629,6 @@ def train(train_path, model_name):
                     1) == 2).nonzero().squeeze(1).item()
                 minibatch_loss += - (E[tuple(frontier)].exp()[target_edge_idx] / E[tuple(frontier)].exp().sum()).log()
                 batch_size += 1
-
-                # print(f'b {time.process_time() - start_time}')
-
-                # env.visualise(graph, special_edges=tree_edges, opt_path=opt_path)
-
-                # tau_ = TAU
-                # while True:
-                #     #start = time.process_time()
-                #
-                #     explore_steps = random.randint(0, tau_)
-                #     adj_list, start_node, goal_node, edge_priority, edge_to_index, tree_nodes, tree_edges, frontier = helper(model, env, graph, explore_steps)
-                #
-                #     #print(f'a {time.process_time() - start}')
-                #
-                #     if len(tree_edges) != 2 * explore_steps:
-                #         #opt_path = dijkstra(graph.x[:, :2], adj_list, start_node, goal_node)
-                #         #env.visualise(graph, special_edges=tree_edges, opt_path=opt_path)
-                #         tau_ //= 2
-                #         continue
-                #
-                #     #start = time.process_time()
-                #
-                #     opt_path = dijkstra(graph.x[:, :2], adj_list, start_node, goal_node)
-                #
-                #     #print(f'b {time.process_time() - start}')
-                #
-                #     break
-                #
-                # #start = time.process_time()
-                #
-                # frontier_edges = [edge_to_index[edge] for edge in frontier]
-                # t = edge_priority.index_select(0, torch.LongTensor(frontier_edges).to(device))
-                # p = None
-                #
-                # if idx == BATCH_SIZE - 1:
-                #     env.visualise(graph, special_edges=tree_edges, opt_path=opt_path)
-                #
-                # for u, v in opt_path:
-                #     if u in tree_nodes and v not in tree_nodes:
-                #         p = edge_priority[edge_to_index[(u, v)]]
-                #         break
-                #
-                # if p is None:
-                #     continue
-                #
-                # minibatch_loss += -torch.log(p.exp() / t.exp().sum())
-
-                # print(f'c {time.process_time() - start}')
 
             minibatch_loss /= batch_size
 
@@ -718,7 +737,8 @@ if __name__ == '__main__':
     env_x = Scatter2D(10, 10, map=world_x)
     env_scatter = Scatter2D(10, 10, map=world_scatter)
 
-    make_data('checker_corridor', [env_checker, env_corridor], 500)
+    #evaluate(env_corridor, model1, 100, 123)
 
-    train('objs/train_fixed_start_end.pkl', 'model_checker_corridor')
+    make_data('checker_corridor', [env_checker, env_corridor], 500)
+    train('objs/checker_corridor.pkl', 'model_checker_corridor')
 
