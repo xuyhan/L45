@@ -469,7 +469,7 @@ def train():
     model = Model(in_dim=6)  # .to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-    env = Scatter2D(10, 10, [0, 0], [10, 10])
+    env = Scatter2D(10, 10)
 
     file = open('objs/train.pkl', 'rb')
     dataset = pickle.load(file)
@@ -569,6 +569,6 @@ def train():
 
 if __name__ == '__main__':
     plt.rcParams['figure.dpi'] = 120
-    test()
+    make_data()
 
     #
