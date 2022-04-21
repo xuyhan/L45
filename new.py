@@ -155,14 +155,37 @@ class Env2D:
 
         return graph, adj_list, costs, opt_path, dist, prev
 
-    def rgg(self):
+    def start_end_seeded(self, n, s):
+        torch.random.manual_seed(s)
+        ret = []
+        for _ in range(n):
+            while True:
+                start = torch.rand(2) * torch.tensor([self.width, self.height])
+                end = torch.rand(2) * torch.tensor([self.width, self.height])
+                if self.not_in_obstacle(start) and self.not_in_obstacle(end):
+                    break
+            ret.append([
+                list(start.numpy()),
+                list(end.numpy())
+            ])
+        return ret
+
+    def rgg(self, start_end=None, force_path=False):
+        while True:
+            graph = self._rgg(start_end=start_end)
+            graph, adj_list, costs, opt_path, dist, prev = self.graph_properties(graph)
+            if opt_path == [] and force_path:
+                continue
+            return graph, adj_list, costs, opt_path, dist, prev
+
+    def _rgg(self, start_end=None):
         rgg_size = self.n_samples + 2
 
         r = torch.rand((self.n_samples, 2)) * torch.tensor([self.width, self.height])  # [[x1,y1],[x2,y2],...,[xn,yn]]
 
-        if self.start is not None:
-            start = torch.tensor(self.start)
-            end = torch.tensor(self.end)
+        if start_end is not None:
+            start = torch.tensor(start_end[0])
+            end = torch.tensor(start_end[1])
         else:
             while True:
                 start = torch.rand(2) * torch.tensor([self.width, self.height])
@@ -249,16 +272,20 @@ class Env2D:
 
 
 class Scatter2D(Env2D):
-    def __init__(self, *args):
+    def __init__(self, *args, obs=None):
         super().__init__(*args)
+        if obs is None:
+            obs = set()
+        self.obstacles |= obs
 
     def gen(self):
-        for _ in range(1):
-            x = 5  # random.randint(0, self.width - 1)
-            y = 8  # random.randint(0, self.height - 1)
-            for y_ in range(self.height):
-                if y_ not in [y - 1, y, y + 1]:
-                    self.obstacles.add((x, y_))
+        pass
+        # for _ in range(1):
+        #     x = 5  # random.randint(0, self.width - 1)
+        #     y = 8  # random.randint(0, self.height - 1)
+        #     for y_ in range(self.height):
+        #         if y_ not in [y - 1, y, y + 1]:
+        #             self.obstacles.add((x, y_))
 
 
 def dijkstra(adj_list, costs, src, dst):
@@ -346,78 +373,106 @@ def helper(E, env, graph, explore_steps, train_mode=False):
     return tree_nodes, tree_edges, frontier, success, steps
 
 
-# def helper_(model, env, graph, explore_steps):
-#     start_node = graph.x.shape[0] - 2
-#     goal_node = graph.x.shape[0] - 1
-#     frontier = []
-#     frontier_set = set()
-#
-#     def is_collide(edge):
-#         u, v = edge
-#         x0, y0 = graph.x[u][0].item(), graph.x[u][1].item()
-#         x1, y1 = graph.x[v][0].item(), graph.x[v][1].item()
-#         return env.intersects([x0, y0], [x1, y1])
-#
-#     adj_list = defaultdict(list)
-#     for [u, v] in graph.edge_index.T:
-#         adj_list[u.item()].append(v.item())
-#
-#     edge_priority = model(graph.x, graph.edge_index).squeeze()
-#     edge_to_index = {(edge[0].item(), edge[1].item()): idx for idx, edge in enumerate(graph.edge_index.T)}
-#
-#     for node in adj_list[start_node]:
-#         edge = (start_node, node)
-#         if not is_collide(edge):
-#             frontier.append((-edge_priority[edge_to_index[(start_node, node)]], edge))
-#         frontier_set.add(edge)
-#
-#     heapq.heapify(frontier)
-#
-#     tree_nodes = {start_node}
-#     tree_edges = set()
-#
-#     for _ in range(explore_steps):
-#         # expand tree using highest priority edge
-#
-#         if frontier == []:
-#             break
-#
-#         (val, (u, v)) = heapq.heappop(frontier)
-#
-#         tree_nodes.add(v)
-#         tree_edges.add((u, v))
-#         tree_edges.add((v, u))
-#
-#         for node in adj_list[v]:
-#             new_edge = (v, node)
-#             assert v != node
-#             if new_edge not in frontier_set and (node, v) not in frontier_set and new_edge not in tree_edges:
-#                 if not is_collide(new_edge):
-#                     new_item = (-edge_priority[edge_to_index[new_edge]], new_edge)
-#                     heapq.heappush(frontier, new_item)
-#                 frontier_set.add(new_edge)
-#
-#         frontier_set.remove((u, v))
-#
-#         if v == goal_node:
-#             break
-#
-#         # env.visualise(graph, special_edges=tree_edges, frontier_edges=list(frontier_set))
-#
-#     return adj_list, start_node, goal_node, edge_priority, edge_to_index, tree_nodes, tree_edges, list(frontier_set)
+def tree_to_path(tree_edges, pos, src, dst):
+    adj_list = defaultdict(list)
+    nodes = set()
+    for [u, v] in tree_edges.T:
+        adj_list[v.item()].append(u.item())   # need to revert edge directions in tree
+        nodes |= {u.item(), v.item()}
+
+    dist = {node: float('inf') for node in nodes}
+    prev = {node: None for node in nodes}
+
+    dist[dst] = 0
+
+    while nodes:
+        cur = min(nodes, key=lambda node: dist[node])
+        nodes.remove(cur)
+        if dist[cur] == float('inf'):
+            break
+
+        for neighbor in adj_list[cur]:
+            cost_new = dist[cur] + (pos[cur] - pos[neighbor]).pow(2).sum().pow(0.5).item()
+            if cost_new < dist[neighbor]:
+                dist[neighbor] = cost_new
+                prev[neighbor] = cur
+
+    path = deque()
+    cur = src
+    while prev[cur] is not None:
+        path.append((cur, prev[cur]))
+        cur = prev[cur]
+    return list(path), dist[src]
+
+
+def evaluate(env, model, n_instances, seed):
+    success_count = 0
+    running_time_total = 0
+    path_cost_total = 0
+
+    start_end = env.start_end_seeded(n_instances, s=seed)
+
+    for se in tqdm(start_end):
+        time_start = time.process_time()
+
+        success = False
+
+        while not success:
+            graph = env._rgg(se)
+            E = model(graph.x, graph.edge_index).squeeze()  # [n_nodes, n_nodes]
+            tree_nodes, tree_edges, frontier, success, steps = helper(E, env, graph, 1000)
+
+        #env.visualise(graph, special_edges=tree_edges, frontier_edges=frontier)
+
+        path, distance = tree_to_path(tree_edges, pos=graph.x[:, :2], src=graph.x.shape[0] - 2, dst=graph.x.shape[0] - 1)
+        assert path != []
+        success_count += 1
+        path_cost_total += distance
+        running_time_total += time.process_time() - time_start
+
+    print(f'Success rate: {success_count / n_instances : .3f}')
+    print(f'Average time: {running_time_total / success_count : .3f}')
+    print(f'Average cost: {path_cost_total / success_count : .3f}')
+
+
+def evaluate_baseline(env, n_instances, seed):
+    success_count = 0
+    running_time_total = 0
+    path_cost_total = 0
+
+    start_end = env.start_end_seeded(n_instances, s=seed)
+
+    for se in tqdm(start_end):
+        time_start = time.process_time()
+
+        graph, adj_list, costs, opt_path, dist, prev = env.rgg(force_path=True, start_end=se)
+
+        if opt_path != []:
+            success_count += 1
+        
+        path_cost_total += dist[graph.x.shape[0] - 2]
+        running_time_total += time.process_time() - time_start
+
+    print(f'Success rate: {success_count / n_instances : .3f}')
+    print(f'Average time: {running_time_total / success_count : .3f}')
+    print(f'Average cost: {path_cost_total / success_count : .3f}')
+
+
+
+
+
 
 
 def test():
     device = torch.device('cpu')
     model = Model(in_dim=6).to(device)
-    model.load_state_dict(torch.load('models/always_true.pth'))
+    model.load_state_dict(torch.load('models/model_random.pth'))
 
     env = Scatter2D(10, 10)
-    rg = env.rgg()
+    graph, adj_list, costs, opt_path, dist, prev = env.rgg(force_path=True)
 
-    graph, adj_list, costs, opt_path, dist, prev = env.graph_properties(rg)
-    E = model(rg.x, rg.edge_index).squeeze()  # [n_nodes, n_nodes]
-    tree_nodes, tree_edges, frontier, success, steps = helper(E, env, rg, 33)
+    E = model(graph.x, graph.edge_index).squeeze()  # [n_nodes, n_nodes]
+    tree_nodes, tree_edges, frontier, success, steps = helper(E, env, graph, 1000)
 
     oracle_node = min(tree_nodes, key=lambda x: dist[x])
     oracle_node_next = prev[oracle_node]
@@ -427,7 +482,7 @@ def test():
     if oracle_node_next:
         oracle_edge = torch.LongTensor([oracle_node, oracle_node_next])
 
-    env.visualise(rg, special_edges=tree_edges, frontier_edges=frontier, oracle_edge=oracle_edge, opt_path=opt_path)
+    env.visualise(graph, special_edges=tree_edges, frontier_edges=frontier, oracle_edge=oracle_edge, opt_path=opt_path)
 
     print(f'Success: {success} Steps: {steps}')
 
@@ -446,23 +501,16 @@ class CustomDataset:
         return len(self.instances)
 
 
-def make_data():
+def make_data(name, size):
     dataset = CustomDataset()
-    pbar = tqdm(range(1000))
+    pbar = tqdm(range(size))
     env = Scatter2D(10, 10)
 
     for _ in pbar:
-        while True:
-            graph = env.rgg()
-            graph, adj_list, costs, opt_path, dist, prev = env.graph_properties(graph)
-            if opt_path == []:
-                continue
-            dataset.add_example(graph, adj_list, costs, opt_path, dist, prev)
-            break
-
+        dataset.add_example(*env.rgg(force_path=True))
         pbar.set_postfix_str(f'Generating RGGs')
 
-    file = open('objs/train_random_start_end.pkl', 'wb')
+    file = open(f'objs/{name}.pkl', 'wb')
     pickle.dump(dataset, file)
 
 
@@ -577,7 +625,30 @@ def train(train_path, model_name):
 
 if __name__ == '__main__':
     plt.rcParams['figure.dpi'] = 120
+
+    model1 = Model(in_dim=6)
+    model1.load_state_dict(torch.load('models/model_random.pth'))
+
+    model2 = Model(in_dim=6)
+    model2.load_state_dict(torch.load('models/model_fixed.pth'))
+
+    env_train = Scatter2D(10, 10, obs={(5,0),(5,1),(5,2),(5,3),(5,4),(5,5),(5,6)})
+    env_test = Scatter2D(10, 10, obs={(2,0),(3,1),(5,2),(8,6),(4,4),(7,5),(2,6)})
+    env_hard = Scatter2D(10, 10, obs={
+        (1,1),(1,2),(1,3),(1,4),(1,5),(1,6),(1,7),(1,8),
+        (3, 1), (3, 2), (3, 3), (3, 4), (3, 5), (3, 6), (3, 7), (3, 8),
+        (5, 1), (5, 2), (5, 3), (5, 4), (5, 5), (5, 6), (5, 7), (5, 8),
+        (7, 1), (7, 2), (7, 3), (7, 4), (7, 5), (7, 6), (7, 7), (7, 8),
+        (9, 1), (9, 2), (9, 3), (9, 4), (9, 5), (9, 6), (9, 7), (9, 8),
+    })
+
+    evaluate(env_hard, model1, n_instances=100, seed=123)
+    evaluate(env_hard, model2, n_instances=100, seed=123)
+
+
+    evaluate_baseline(env_hard, n_instances=100, seed=123)
+    #evaluate(env, model, 'objs/test_random_start_end.pkl')
     #train('objs/train_fixed_start_end.pkl', 'model_fixed')
-    train('objs/train_random_start_end.pkl', 'model_random')
+    #train('objs/train_random_start_end.pkl', 'model_random')
 
     #
