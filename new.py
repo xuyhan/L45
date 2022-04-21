@@ -429,7 +429,12 @@ def make_data():
     for _ in pbar:
         graph = env.rgg()
 
-        dataset.add_example(*env.graph_properties(graph))
+        while True:
+            graph, adj_list, costs, opt_path, dist, prev = env.graph_properties(graph)
+            if opt_path == []:
+                continue
+            dataset.add_example(graph, adj_list, costs, opt_path, dist, prev)
+            break
 
         pbar.set_postfix_str(f'Generating RGGs')
 
@@ -467,9 +472,8 @@ def train():
                 # start_time = time.process_time()
                 E = model(graph.x, graph.edge_index).squeeze()  # [n_nodes, n_nodes]
 
-                _, _, _, success, steps = helper(torch.clone(E), env, graph, explore_steps=1000)
-                if not success:
-                    continue
+                _, _, _, success, steps = helper(torch.clone(E), env, graph, explore_steps=1000000)
+                assert success
                 tree_nodes, tree_edges, frontier, _, _ = helper(torch.clone(E), env, graph,
                                                                 explore_steps=random.randint(1, steps - 1))
 
