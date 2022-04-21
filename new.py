@@ -66,20 +66,31 @@ class Model(torch.nn.Module):
 
 
 class Env2D:
-    def __init__(self, width, height, start, end):
+    def __init__(self, width, height, start=None, end=None):
         self.width = width
         self.height = height
-        self.start = start
-        self.end = end
         self.obstacles = set()
 
         self.k = K
         self.n_samples = N_SAMPLES
 
+        self.start = start
+        self.end = end
+
         self.gen()
 
     def gen(self):
         raise NotImplementedError()
+
+    def not_in_obstacle(self, pos):
+        for obs_x, obs_y in self.obstacles:
+            ox0 = obs_x
+            ox1 = obs_x + 1
+            oy0 = obs_y
+            oy1 = obs_y + 1
+            if ox0 <= pos[0] <= ox1 and oy0 <= pos[1] <= oy1:
+                return False
+        return True
 
     def not_collide(self, pos1, pos2):
         return not self.intersects(pos1.cpu().numpy(), pos2.cpu().numpy())
@@ -95,6 +106,10 @@ class Env2D:
                 if y1 >= oy0 and y0 <= oy1 or oy1 >= y0 and oy0 <= y1:
                     return True
             return False
+
+        if x1 < x0:
+            x0, x1 = x1, x0
+            y0, y1 = y1, y0
 
         m = (y1 - y0) / (x1 - x0)
         c = y0 - m * x0
@@ -114,7 +129,7 @@ class Env2D:
             if oy0 <= p <= oy1 or oy0 <= q <= oy1:
                 return True
 
-            if p < oy0 and oy1 < q:
+            if p < oy0 and oy1 < q or p > oy0 and oy1 > q:
                 return True
 
         return False
@@ -144,9 +159,20 @@ class Env2D:
         rgg_size = self.n_samples + 2
 
         r = torch.rand((self.n_samples, 2)) * torch.tensor([self.width, self.height])  # [[x1,y1],[x2,y2],...,[xn,yn]]
-        r = torch.row_stack([r, torch.tensor([self.start, self.end])])
 
-        l2 = (r - torch.tensor(self.end)).pow(2).sum(dim=1)
+        if self.start is not None:
+            start = torch.tensor(self.start)
+            end = torch.tensor(self.end)
+        else:
+            while True:
+                start = torch.rand(2) * torch.tensor([self.width, self.height])
+                end = torch.rand(2) * torch.tensor([self.width, self.height])
+                if self.not_in_obstacle(start) and self.not_in_obstacle(end):
+                    break
+
+        r = torch.row_stack([r, start, end])
+
+        l2 = (r - end).pow(2).sum(dim=1)
         r = torch.column_stack([r, l2])
 
         # check if each point is in free space or obstacle or goal
@@ -186,15 +212,12 @@ class Env2D:
             rect = plt.Rectangle((x, y), 1, 1, color='purple')
             ax.add_artist(rect)
 
-        ax.scatter(px_free, py_free, c='cyan')
+        ax.scatter(px_free, py_free, c='lime', alpha=0.5)
         ax.scatter(px_collide, py_collide, c='red')
-
-        ax.scatter(graph.x[-2, 0], graph.x[-2, 1], c='black')
-        ax.scatter(graph.x[-1, 0], graph.x[-1, 1], c='black')
 
         us, vs = graph.edge_index
         lines = [(pos[us[i].item()], pos[vs[i].item()]) for i in range(graph.edge_index.shape[1])]
-        lc = matplotlib.collections.LineCollection(lines, colors='green', linewidths=2)
+        lc = matplotlib.collections.LineCollection(lines, colors='green', linewidths=2, alpha=0.2)
         ax.add_collection(lc)
 
         if opt_path:
@@ -209,13 +232,16 @@ class Env2D:
         ax.add_collection(lc)
 
         lines = [(pos[u.item()], pos[v.item()]) for [u, v] in frontier_edges.T]
-        lc = matplotlib.collections.LineCollection(lines, colors='cyan', linewidths=3)
+        lc = matplotlib.collections.LineCollection(lines, colors='cyan', linewidths=3, alpha=0.5)
         ax.add_collection(lc)
 
         if oracle_edge is not None:
             lines = [(pos[oracle_edge[0].item()], pos[oracle_edge[1].item()])]
             lc = matplotlib.collections.LineCollection(lines, colors='yellow', linewidths=6)
             ax.add_collection(lc)
+
+        ax.scatter([pos[-2, 0]], [pos[-2, 1]], marker='s', s=120, c='gold', zorder=2)
+        ax.scatter([pos[-1, 0]], [pos[-1, 1]], marker='*', s=250, c='gold', zorder=2)
 
         ax.autoscale()
         ax.margins(0.1)
@@ -382,18 +408,15 @@ def helper(E, env, graph, explore_steps, train_mode=False):
 def test():
     device = torch.device('cpu')
     model = Model(in_dim=6).to(device)
-    model.load_state_dict(torch.load('models/cool.pth'))
+    model.load_state_dict(torch.load('models/always_true.pth'))
 
-    env = Scatter2D(10, 10, [0, 0], [10, 10])
+    env = Scatter2D(10, 10)
     rg = env.rgg()
 
     graph, adj_list, costs, opt_path, dist, prev = env.graph_properties(rg)
-    start_node = rg.x.shape[0] - 2
-    goal_node = rg.x.shape[0] - 1
     E = model(rg.x, rg.edge_index).squeeze()  # [n_nodes, n_nodes]
-    tree_nodes, tree_edges, frontier, success, steps = helper(E, env, rg, 25)
+    tree_nodes, tree_edges, frontier, success, steps = helper(E, env, rg, 33)
 
-    opt_path, dist, prev = dijkstra(adj_list, costs, start_node, goal_node)
     oracle_node = min(tree_nodes, key=lambda x: dist[x])
     oracle_node_next = prev[oracle_node]
 
@@ -427,9 +450,8 @@ def make_data():
     env = Scatter2D(10, 10, [0, 0], [10, 10])
 
     for _ in pbar:
-        graph = env.rgg()
-
         while True:
+            graph = env.rgg()
             graph, adj_list, costs, opt_path, dist, prev = env.graph_properties(graph)
             if opt_path == []:
                 continue
@@ -547,6 +569,6 @@ def train():
 
 if __name__ == '__main__':
     plt.rcParams['figure.dpi'] = 120
-    make_data()
+    test()
 
     #
