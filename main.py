@@ -188,18 +188,11 @@ def RRT_GNN(startpos, endpos, obstacles, n_iter, radius, stepSize, model):
 
     for _ in range(n_iter):
         for t in range(10):
-            x, edge_index = G.to_data()
-            pred = model(x, edge_index, batch=torch.LongTensor([0] * x.shape[0])).squeeze()
-            dx = random() * 1.0 - 0.5
-            dy = random() * 1.0 - 0.5
+            #x, edge_index = G.to_data()
+            #pred = model(x, edge_index, batch=torch.LongTensor([0] * x.shape[0])).squeeze()
+            #randvex = (pred[0].item(), pred[1].item())
 
-            randvex = (pred[0].item(), pred[1].item())
-
-
-
-            # raise Exception()
-            # randvex = G.randomPosition()
-
+            randvex = G.randomPosition()
             if t == 9:
                 raise Exception()
 
@@ -247,8 +240,7 @@ def RRT_GNN(startpos, endpos, obstacles, n_iter, radius, stepSize, model):
 
             G.success = True
 
-    return G
-
+        yield G
 
 def RRT_star(startpos, endpos, obstacles, n_iter, radius, stepSize, data_store):
     G = Graph(startpos, endpos)
@@ -309,8 +301,6 @@ def RRT_star(startpos, endpos, obstacles, n_iter, radius, stepSize, data_store):
 
     return G
 
-
-
 def dijkstra(G):
     srcIdx = G.vex2idx[G.startpos]
     dstIdx = G.vex2idx[G.endpos]
@@ -344,10 +334,9 @@ def dijkstra(G):
 
 
 
-def plot(G, obstacles, radius, path=None):
+def plot(fig, ax, G, obstacles, radius, path=None):
     px = [x for x, y in G.vertices]
     py = [y for x, y in G.vertices]
-    fig, ax = plt.subplots()
 
     for obs in obstacles:
         circle = plt.Circle(obs, radius, color='red')
@@ -368,6 +357,8 @@ def plot(G, obstacles, radius, path=None):
 
     ax.autoscale()
     ax.margins(0.1)
+
+    plt.draw()
     plt.show()
 
 
@@ -380,7 +371,7 @@ def pathSearch(startpos, endpos, obstacles, n_iter, radius, stepSize):
 
 import torch_geometric
 import networkx as nx
-from torch_geometric.nn import GCNConv, Linear
+from torch_geometric.nn import GCNConv, Linear, GATConv
 import torch.nn.functional as F
 from torch_geometric.nn import global_add_pool
 
@@ -393,11 +384,11 @@ class PathFinder(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.convs = torch.nn.ModuleList()
-        self.convs.append(GCNConv(5, 32))
+        self.convs.append(GATConv(5, 32))
         n_layers = 4
 
         for i in range(n_layers - 1):
-            self.convs.append(GCNConv(32, 32))
+            self.convs.append(GATConv(32, 32))
 
         self.linear = Linear(32, 2)
 
@@ -410,37 +401,40 @@ class PathFinder(torch.nn.Module):
         return x
 
 
-# if __name__ == '__main__':
-#     startpos = (0., 0.) #(random() * 10, random() * 10)  # (0., 0.)
-#     endpos = (4, 4.) #(random() * 10, random() * 10)  # (10., 10.)
-#     obstacles = []  # [(1., 1.), (2., 2.)]
-#     n_iter = 500
-#     radius = 0.5
-#     stepSize = 0.7
-#
-#     model = PathFinder()
-#     model.load_state_dict(torch.load('models/model.pth', map_location=torch.device('cpu')))
-#
-#     G = RRT_GNN(startpos, endpos, obstacles, n_iter, radius, stepSize, model)
-#
-#     # test_g = data_store[40]
-#     # visualise_graph(test_g)
-#
-#     if G.success:
-#         print('Success')
-#         path = dijkstra(G)
-#         print(path)
-#         plot(G, obstacles, radius, path)
-#     else:
-#         print('Failure')
-#         plot(G, obstacles, radius)
-#
 if __name__ == '__main__':
+    startpos = (0., 0.) #(random() * 10, random() * 10)  # (0., 0.)
+    endpos = (4, 4.) #(random() * 10, random() * 10)  # (10., 10.)
+    obstacles = []  # [(1., 1.), (2., 2.)]
+    n_iter = 500
+    radius = 0.5
+    stepSize = 0.7
+
+    model = PathFinder()
+    model.load_state_dict(torch.load('models/model.pth', map_location=torch.device('cpu')))
+
+    fig, ax = plt.subplots()
+
+    for G in RRT_GNN(startpos, endpos, obstacles, n_iter, radius, stepSize, model):
+        plot(fig, ax, G, obstacles, radius)
+
+    # test_g = data_store[40]
+    # visualise_graph(test_g)
+
+    if G.success:
+        print('Success')
+        path = dijkstra(G)
+        print(path)
+        plot(fig, ax, G, obstacles, radius, path)
+    else:
+        print('Failure')
+        plot(fig, ax, G, obstacles, radius)
+
+if __name__ == '_ _main__':
     from tqdm import tqdm
 
     data_store = []
     model = PathFinder()
-    N_RUNS = 50
+    N_RUNS = 200
     N_EPOCHS = 100
 
     for _ in tqdm(range(N_RUNS)):
@@ -512,3 +506,4 @@ if __name__ == '__main__':
         test_loss /= len(test_data)
 
         print('Epoch %s Test Loss %s' % (epoch, test_loss))
+#%%

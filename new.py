@@ -1,7 +1,7 @@
 import random
 import torch
 from torch_geometric.data import Data, DataLoader
-from torch_geometric.nn import GATConv, Linear
+from torch_geometric.nn import GATConv, Linear, GCNConv
 from torch.nn import ReLU, Softmax
 from tqdm import tqdm
 from collections import defaultdict, deque
@@ -10,10 +10,17 @@ import math
 import matplotlib.pyplot as plt
 import matplotlib
 from torch_geometric.utils.undirected import to_undirected
+import collections
+import time
+import heapq
+import pickle
 
-TAU = 10
-N_SAMPLES = 200
+
+TAU = 50
+N_SAMPLES = 300
 K = 5
+BATCH_SIZE = 32
+N_OBSTACLES = 6
 
 class Model(torch.nn.Module):
     def __init__(self, in_dim):
@@ -23,6 +30,10 @@ class Model(torch.nn.Module):
         self.conv1 = GATConv(32, 64, edge_dim=10)
         self.conv2 = GATConv(64, 64, edge_dim=10)
         self.conv3 = GATConv(64, 64, edge_dim=10)
+        self.conv4 = GATConv(64, 64, edge_dim=10)
+        self.conv5 = GATConv(64, 64, edge_dim=10)
+        self.sigmoid = torch.nn.Sigmoid()
+
         self.mlp = torch.nn.Sequential(
             Linear(64 * 2, 32),
             ReLU(),
@@ -31,16 +42,27 @@ class Model(torch.nn.Module):
         self.relu = torch.nn.ReLU()
 
     def forward(self, x, edge_index):
+        n_nodes = x.shape[0]
+
         x = self.lin1(x)
         x = self.conv1(x, edge_index)
         x = self.relu(x)
         x = self.conv2(x, edge_index)
         x = self.relu(x)
         x = self.conv3(x, edge_index)
+        x = self.relu(x)
+        x = self.conv4(x, edge_index)
+        x = self.relu(x)
+        x = self.conv5(x, edge_index)
+        x = self.sigmoid(x)
 
         us, vs = edge_index
-        t = torch.column_stack([x.index_select(0, us), x.index_select(0, vs)])
-        return self.mlp(t)
+        x = torch.column_stack([x.index_select(0, us), x.index_select(0, vs)])
+        x = self.mlp(x).squeeze()
+
+        E = x.new_zeros((n_nodes, n_nodes))
+        E[tuple(edge_index)] += x
+        return E
 
 
 class Env2D:
@@ -59,6 +81,9 @@ class Env2D:
     def gen(self):
         raise NotImplementedError()
 
+    def not_collide(self, pos1, pos2):
+        return not self.intersects(pos1.cpu().numpy(), pos2.cpu().numpy())
+
     def intersects(self, pos1, pos2):
         x0, y0 = pos1
         x1, y1 = pos2
@@ -71,13 +96,18 @@ class Env2D:
             oy0 = obs_y
             oy1 = obs_y + 1
 
+            if not (x1 >= ox0 and x0 <= ox1 or ox1 >= x0 and ox0 <= x1):
+                continue
+
             p = m * ox0 + c
             q = m * ox1 + c
 
-            if oy0 < p < oy1 or oy0 < q < oy1:
+            if oy0 <= p <= oy1 or oy0 <= q <= oy1:
+                #print(f'INTERSECTION {(x0, y0)} {(x1, y1)} {(obs_x, obs_y)}')
                 return True
 
             if p < oy0 and oy1 < q:
+                #print(f'INTERSECTION {(x0, y0)} {(x1, y1)} {(obs_x, obs_y)}')
                 return True
 
         return False
@@ -113,14 +143,13 @@ class Env2D:
         edge_index = to_undirected(torch.row_stack([us, vs]))
         return Data(x=r, edge_index=edge_index)
 
-    def visualise(self, graph):
+    def visualise(self, graph, special_edges=torch.LongTensor([]), frontier_edges=torch.LongTensor([]), oracle_edge=None, opt_path=None):
         pos = graph.x[:, :2].detach().cpu().numpy()
         px_free = [x for idx, [x, y] in enumerate(pos) if graph.x[idx, 3] == 1]
         py_free = [y for idx, [x, y] in enumerate(pos) if graph.x[idx, 3] == 1]
 
         px_collide = [x for idx, [x, y] in enumerate(pos) if graph.x[idx, 4] == 1]
         py_collide = [y for idx, [x, y] in enumerate(pos) if graph.x[idx, 4] == 1]
-
 
         fig, ax = plt.subplots()
 
@@ -139,18 +168,25 @@ class Env2D:
         lc = matplotlib.collections.LineCollection(lines, colors='green', linewidths=2)
         ax.add_collection(lc)
 
-        adj_list = defaultdict(list)
-        for [u, v] in graph.edge_index.T:
-            adj_list[u.item()].append(v.item())
-        opt_path = dijkstra(adj_list, graph.x.shape[0] - 2, graph.x.shape[0] - 1)
+        if opt_path:
+            path_lines = []
+            for u, v in opt_path:
+                path_lines.append((pos[u], pos[v]))
+            lc2 = matplotlib.collections.LineCollection(path_lines, colors='blue', linewidths=6)
+            ax.add_collection(lc2)
 
-        path_lines = []
-        for u, v in opt_path:
-            path_lines.append((pos[u], pos[v]))
-        # if path is not None:
-        #     paths = [(path[i], path[i+1]) for i in range(len(path)-1)]
-        lc2 = matplotlib.collections.LineCollection(path_lines, colors='blue', linewidths=3)
-        ax.add_collection(lc2)
+        lines = [(pos[u.item()], pos[v.item()]) for [u, v] in special_edges.T]
+        lc = matplotlib.collections.LineCollection(lines, colors='magenta', linewidths=3)
+        ax.add_collection(lc)
+
+        lines = [(pos[u.item()], pos[v.item()]) for [u, v] in frontier_edges.T]
+        lc = matplotlib.collections.LineCollection(lines, colors='cyan', linewidths=3)
+        ax.add_collection(lc)
+
+        if oracle_edge is not None:
+            lines = [(pos[oracle_edge[0].item()], pos[oracle_edge[1].item()])]
+            lc = matplotlib.collections.LineCollection(lines, colors='yellow', linewidths=6)
+            ax.add_collection(lc)
 
         ax.autoscale()
         ax.margins(0.1)
@@ -162,17 +198,21 @@ class Scatter2D(Env2D):
         super().__init__(*args)
 
     def gen(self):
-        for _ in range(0):
-            x = random.randint(0, self.width - 1)
-            y = random.randint(0, self.height - 1)
-            self.obstacles.add((x, y))
+        for _ in range(1):
+            x = 5 #random.randint(0, self.width - 1)
+            y = 2 #random.randint(0, self.height - 1)
+            for y_ in range(self.height):
+                if y_ not in [y - 1, y, y + 1]:
+                    self.obstacles.add((x, y_))
 
 
-def dijkstra(adj_list, src, dst):
+
+def dijkstra(pos, adj_list, src, dst):
     nodes = list(adj_list.keys())
     dist = {node: float('inf') for node in nodes}
     prev = {node: None for node in nodes}
-    dist[src] = 0
+
+    dist[dst] = 0
 
     while nodes:
         cur = min(nodes, key=lambda node: dist[node])
@@ -181,105 +221,296 @@ def dijkstra(adj_list, src, dst):
             break
 
         for neighbor in adj_list[cur]:
-            cost_new = dist[cur] + 1
+            cost_new = dist[cur] + (pos[neighbor] - pos[cur]).pow(2).sum().pow(0.5).item()
             if cost_new < dist[neighbor]:
                 dist[neighbor] = cost_new
                 prev[neighbor] = cur
 
     path = deque()
-    cur = dst
+    cur = src
     while prev[cur] is not None:
-        path.appendleft((prev[cur], cur))
+        path.append((cur, prev[cur]))
         cur = prev[cur]
-    return list(path)
+    return list(path), dist, prev
 
+
+def helper(E, env, graph, explore_steps, train_mode=False):
+    tree_nodes = []
+    tree_edges = []
+
+    start_node = graph.x.shape[0] - 2
+    goal_node = graph.x.shape[0] - 1
+
+    tree_nodes.append(start_node)
+
+    success = False
+
+    steps = 0
+
+    for steps in range(explore_steps):
+        tree_nodes_ = torch.LongTensor(tree_nodes)
+
+        us, vs = torch.where(E[tree_nodes_, :] != 0)
+
+        if us.shape[0] == 0:
+            break
+
+        top = E[tree_nodes_[us], vs].argmax()
+
+        start, end = tree_nodes[us[top].item()], vs[top].item()
+
+        if train_mode or env.not_collide(graph.x[start, :2], graph.x[end, :2]):
+            E[:, end] = 0
+            tree_nodes.append(end)
+            tree_edges.append([start, end])
+
+            if end == goal_node:
+                success = True
+                break
+        else:
+            E[start, end] = 0
+            E[end, start] = 0
+
+
+        # adj_list = defaultdict(list)
+        # for [u, v] in graph.edge_index.T:
+        #     adj_list[u.item()].append(v.item())
+        # start_node = graph.x.shape[0] - 2
+        # goal_node = graph.x.shape[0] - 1
+        # opt_path, dist, prev = dijkstra(graph.x[:, :2], adj_list, start_node, goal_node)
+        # oracle_node = min(tree_nodes, key=lambda x: dist[x])
+        # oracle_node_next = prev[oracle_node]
+        # env.visualise(graph, special_edges=torch.LongTensor(tree_edges).T, oracle_edge=torch.LongTensor([oracle_node, oracle_node_next]), opt_path=opt_path)
+
+
+    tree_nodes_ = torch.LongTensor(tree_nodes)
+    us, vs = torch.where(E[tree_nodes_, :] != 0)
+    frontier = torch.row_stack((tree_nodes_[us], vs))
+
+    tree_edges = torch.LongTensor(tree_edges).T
+
+    return tree_nodes, tree_edges, frontier, success, steps
+
+
+def helper_(model, env, graph, explore_steps):
+    start_node = graph.x.shape[0] - 2
+    goal_node = graph.x.shape[0] - 1
+    frontier = []
+    frontier_set = set()
+
+    def is_collide(edge):
+        u, v = edge
+        x0, y0 = graph.x[u][0].item(), graph.x[u][1].item()
+        x1, y1 = graph.x[v][0].item(), graph.x[v][1].item()
+        return env.intersects([x0, y0], [x1, y1])
+
+    adj_list = defaultdict(list)
+    for [u, v] in graph.edge_index.T:
+        adj_list[u.item()].append(v.item())
+
+    edge_priority = model(graph.x, graph.edge_index).squeeze()
+    edge_to_index = {(edge[0].item(), edge[1].item()) : idx for idx, edge in enumerate(graph.edge_index.T)}
+
+    for node in adj_list[start_node]:
+        edge = (start_node, node)
+        if not is_collide(edge):
+            frontier.append((-edge_priority[edge_to_index[(start_node, node)]], edge))
+        frontier_set.add(edge)
+
+    heapq.heapify(frontier)
+
+    tree_nodes = {start_node}
+    tree_edges = set()
+
+    for _ in range(explore_steps):
+        # expand tree using highest priority edge
+
+        if frontier == []:
+            break
+
+        (val, (u, v)) = heapq.heappop(frontier)
+
+        tree_nodes.add(v)
+        tree_edges.add((u, v))
+        tree_edges.add((v, u))
+
+        for node in adj_list[v]:
+            new_edge = (v, node)
+            assert v != node
+            if new_edge not in frontier_set and (node, v) not in frontier_set and new_edge not in tree_edges:
+                if not is_collide(new_edge):
+                    new_item = (-edge_priority[edge_to_index[new_edge]], new_edge)
+                    heapq.heappush(frontier, new_item)
+                frontier_set.add(new_edge)
+
+        frontier_set.remove((u, v))
+
+        if v == goal_node:
+            break
+
+        #env.visualise(graph, special_edges=tree_edges, frontier_edges=list(frontier_set))
+
+    return adj_list, start_node, goal_node, edge_priority, edge_to_index, tree_nodes, tree_edges, list(frontier_set)
+
+
+def test():
+    device = torch.device('cpu')
+    model = Model(in_dim=6).to(device)
+    model.load_state_dict(torch.load('models/cool.pth'))
+
+    env = Scatter2D(10, 10, [0, 0], [10, 10])
+    rg = env.rgg()
+
+    adj_list = defaultdict(list)
+    for [u, v] in rg.edge_index.T:
+        adj_list[u.item()].append(v.item())
+    start_node = rg.x.shape[0] - 2
+    goal_node = rg.x.shape[0] - 1
+
+    E = model(rg.x, rg.edge_index).squeeze()  # [n_nodes, n_nodes]
+
+    tree_nodes, tree_edges, frontier, success, steps = helper(E, env, rg, 1231)
+
+    opt_path, dist, prev = dijkstra(rg.x[:, :2], adj_list, start_node, goal_node)
+    oracle_node = min(tree_nodes, key=lambda x: dist[x])
+    oracle_node_next = prev[oracle_node]
+
+    oracle_edge = None
+
+    if oracle_node_next:
+        oracle_edge = torch.LongTensor([oracle_node, oracle_node_next])
+
+    env.visualise(rg, special_edges=tree_edges, frontier_edges=frontier, oracle_edge=oracle_edge, opt_path=opt_path)
+
+    print(f'Success: {success} Steps: {steps}')
+
+
+class CustomDataset:
+    def __init__(self):
+        self.instances = []
+
+    def add_example(self, graph, adj_list, opt_path, dist, prev):
+        self.instances.append((graph, adj_list, opt_path, dist, prev))
+
+    def get(self, i):
+        return self.instances[i]
+
+    def len(self):
+        return len(self.instances)
+
+def make_data():
+    dataset = CustomDataset()
+    pbar = tqdm(range(1000))
+    env = Scatter2D(10, 10, [0, 0], [10, 10])
+
+    for _ in pbar:
+        graph = env.rgg()
+
+        adj_list = defaultdict(list)
+        for [u, v] in graph.edge_index.T:
+            adj_list[u.item()].append(v.item())
+        start_node = graph.x.shape[0] - 2
+        goal_node = graph.x.shape[0] - 1
+        opt_path, dist, prev = dijkstra(graph.x[:, :2], adj_list, start_node, goal_node)
+
+        dataset.add_example(graph, adj_list, opt_path, dist, prev)
+
+        pbar.set_postfix_str(f'Generating RGGs')
+
+    file = open('objs/train.pkl', 'wb')
+    pickle.dump(dataset, file)
 
 
 def train():
-    model = Model(in_dim=6)
+    #device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    model = Model(in_dim=6)#.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
     env = Scatter2D(10, 10, [0, 0], [10, 10])
-    dataset = []
 
-    pbar = tqdm(range(1000))
-    for _ in pbar:
-        dataset.append(env.rgg())
-        pbar.set_postfix_str(f'Generating RGG')
+    file = open('objs/train.pkl', 'rb')
+    dataset = pickle.load(file)
 
-    train_dataset = dataset[:500]
-    test_dataset = dataset[500:]
+    idxs = list(np.arange(dataset.len()))
 
+    for epoch in range(200):
+        random.shuffle(idxs)
 
-    for epoch in range(20):
-        pbar = tqdm(range(int(math.ceil(len(train_dataset) / 128))))
+        pbar = tqdm(range(int(math.ceil(len(idxs) / BATCH_SIZE))))
         train_loss = 0
 
         for batch_idx in pbar:
-            minibatch = train_dataset[batch_idx * 128 : min((batch_idx + 1) * 128, len(train_dataset))]
-            minibatch_loss = torch.tensor(0.)
+            minibatch = idxs[batch_idx * BATCH_SIZE : min((batch_idx + 1) * BATCH_SIZE, len(idxs))]
+            minibatch_loss = torch.tensor(0.)#.to(device)
 
-            for graph in minibatch:
-                start_node = graph.x.shape[0] - 2
-                goal_node = graph.x.shape[0] - 1
-                frontier = []
+            batch_size = 0
 
-                adj_list = defaultdict(list)
-                for [u, v] in graph.edge_index.T:
-                    adj_list[u.item()].append(v.item())
+            for instance in minibatch:
+                graph, adj_list, opt_path, dist, prev = dataset.get(instance)
 
-                opt_path = dijkstra(adj_list, start_node, goal_node)
+                #start_time = time.process_time()
+                E = model(graph.x, graph.edge_index).squeeze()  # [n_nodes, n_nodes]
 
-                for node in adj_list[start_node]:
-                    frontier.append((start_node, node))
-
-                edge_priority = model(graph.x, graph.edge_index).squeeze()
-                edge_to_index = {(edge[0].item(), edge[1].item()) : idx for idx, edge in enumerate(graph.edge_index.T)}
-
-                explore_steps = random.randint(0, TAU)
-                tree_nodes = {start_node}
-
-                # perform initial exploration for random number of steps
-                for _ in range(explore_steps):
-                    frontier_edges = [edge_to_index[edge] for edge in frontier]
-                    frontier_priorities = edge_priority.index_select(0, torch.LongTensor(frontier_edges)).argsort().detach().cpu().numpy()
-                    chosen = None
-                    # expand tree using highest priority edge
-                    for pos in frontier_priorities:
-                        u, v = frontier[pos]
-                        x0, y0 = graph.x[u][0].item(), graph.x[u][1].item()
-                        x1, y1 = graph.x[v][0].item(), graph.x[v][1].item()
-
-                        if not env.intersects([x0, y0], [x1, y1]):
-                            chosen = frontier[pos]
-                            break
-
-                    if chosen is None:
-                        break
-
-                    frontier.remove(chosen)
-
-                    tree_nodes.add(chosen[1])
-
-                    for node in adj_list[chosen[1]]:
-                        frontier.append((chosen[1], node))
-
-                if len(tree_nodes) != 1 + explore_steps:
-                    #print('SKIP')
+                _, _, _, success, steps = helper(torch.clone(E), env, graph, explore_steps=1000)
+                if not success:
                     continue
+                tree_nodes, tree_edges, frontier, _, _ = helper(torch.clone(E), env, graph, explore_steps=random.randint(1, steps - 1))
 
-                frontier_edges = [edge_to_index[edge] for edge in frontier]
-                t = edge_priority.index_select(0, torch.LongTensor(frontier_edges))
-                p = None
-                for u, v in opt_path:
-                    if u in tree_nodes and v not in tree_nodes:
-                        p = edge_priority[edge_to_index[(u, v)]]
-                        break
+                oracle_node = min(tree_nodes, key=lambda x : dist[x])
+                oracle_node_next = prev[oracle_node]
 
-                if p is None:
-                    continue
+                target_edge_idx = ((frontier.T == torch.LongTensor([oracle_node, oracle_node_next])).sum(1) == 2).nonzero().squeeze(1).item()
+                minibatch_loss += - (E[tuple(frontier)].exp()[target_edge_idx] / E[tuple(frontier)].exp().sum()).log()
+                batch_size += 1
+                #print(f'b {time.process_time() - start_time}')
 
-                minibatch_loss += -torch.log(p.exp() / t.exp().sum())
+                #env.visualise(graph, special_edges=tree_edges, opt_path=opt_path)
+
+                # tau_ = TAU
+                # while True:
+                #     #start = time.process_time()
+                #
+                #     explore_steps = random.randint(0, tau_)
+                #     adj_list, start_node, goal_node, edge_priority, edge_to_index, tree_nodes, tree_edges, frontier = helper(model, env, graph, explore_steps)
+                #
+                #     #print(f'a {time.process_time() - start}')
+                #
+                #     if len(tree_edges) != 2 * explore_steps:
+                #         #opt_path = dijkstra(graph.x[:, :2], adj_list, start_node, goal_node)
+                #         #env.visualise(graph, special_edges=tree_edges, opt_path=opt_path)
+                #         tau_ //= 2
+                #         continue
+                #
+                #     #start = time.process_time()
+                #
+                #     opt_path = dijkstra(graph.x[:, :2], adj_list, start_node, goal_node)
+                #
+                #     #print(f'b {time.process_time() - start}')
+                #
+                #     break
+                #
+                # #start = time.process_time()
+                #
+                # frontier_edges = [edge_to_index[edge] for edge in frontier]
+                # t = edge_priority.index_select(0, torch.LongTensor(frontier_edges).to(device))
+                # p = None
+                #
+                # if idx == BATCH_SIZE - 1:
+                #     env.visualise(graph, special_edges=tree_edges, opt_path=opt_path)
+                #
+                # for u, v in opt_path:
+                #     if u in tree_nodes and v not in tree_nodes:
+                #         p = edge_priority[edge_to_index[(u, v)]]
+                #         break
+                #
+                # if p is None:
+                #     continue
+                #
+                # minibatch_loss += -torch.log(p.exp() / t.exp().sum())
+
+                #print(f'c {time.process_time() - start}')
+
+            minibatch_loss /= batch_size
 
             optimizer.zero_grad()
             minibatch_loss.backward()
@@ -287,10 +518,10 @@ def train():
 
             train_loss += minibatch_loss
             pbar.set_postfix_str(f'Batch loss {minibatch_loss:.5f} Total train loss {train_loss:.5f}')
+            torch.save(model.state_dict(), 'models/cool2.pth')
 
 
 if __name__ == '__main__':
-    env = Scatter2D(10, 10, [0, 0], [10, 10])
-    rg = env.rgg()
-    env.visualise(rg)
+    plt.rcParams['figure.dpi'] = 120
     train()
+
