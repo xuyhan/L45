@@ -14,6 +14,7 @@ import collections
 import time
 import heapq
 import pickle
+import torch_scatter
 
 TAU = 50
 N_SAMPLES = 300
@@ -589,6 +590,34 @@ def make_data(name, envs, size):
     pickle.dump(dataset, file)
 
 
+def create_mini_batch(graph_list, frontiers, target_edge_idxs):
+    batch_edge_index = graph_list[0].edge_index
+    batch_x = graph_list[0].x
+    batch_frontiers = frontiers[0]
+    batch_batch = torch.zeros((graph_list[0].x.shape[0]), dtype=torch.int64)
+    batch_target_edge_mask = torch.nn.functional.one_hot(
+        torch.LongTensor(target_edge_idxs[0]), frontiers[0].shape[1]
+    ).squeeze()
+
+    for idx, graph in enumerate(graph_list[1:]):
+        batch_x = torch.row_stack([batch_x, graph.x])
+        batch_frontiers = torch.cat([frontiers[0], frontiers[idx] + batch_batch.shape[0]])
+
+        batch_edge_index = torch.column_stack([batch_edge_index, graph.edge_index + batch_batch.shape[0]])
+        batch_batch = torch.cat([batch_batch, 1 + idx + torch.zeros((graph.x.shape[0]), dtype=torch.int64)])
+        batch_target_edge_mask = torch.cat([
+            batch_target_edge_mask,
+            torch.nn.functional.one_hot(
+                torch.LongTensor(target_edge_idxs[idx]), frontiers[idx].shape[1]
+            ).squeeze()
+        ])
+
+    batch_graph = Data(x=batch_x, edge_index=batch_edge_index)
+    return batch_graph, batch_frontiers, batch_target_edge_mask, batch_batch
+
+
+REPLAY_SIZE = 256
+
 def train(train_path, model_name):
     # device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     model = Model(in_dim=6)  # .to(device)
@@ -600,13 +629,72 @@ def train(train_path, model_name):
 
     idxs = list(np.arange(dataset.len()))
 
+    replay_buffer = [None] * REPLAY_SIZE
+    replay_pointer = 0
+
     for epoch in range(30):
         random.shuffle(idxs)
 
-        pbar = tqdm(range(int(math.ceil(len(idxs) / BATCH_SIZE))))
         train_loss = 0
-
         best_loss = float('inf')
+
+        pbar = tqdm(idxs)
+
+        for idx in pbar:
+            graph, adj_list, costs, opt_path, dist, prev = dataset.get(idx)
+            env = dataset.get_env(idx)
+
+            E = model(graph.x, graph.edge_index).squeeze()  # [n_nodes, n_nodes]
+
+            _, _, _, success, steps = helper(torch.clone(E), env, graph, explore_steps=1000000)
+            assert success
+            tree_nodes, tree_edges, frontier, _, _ = helper(torch.clone(E), env, graph,
+                                                            explore_steps=random.randint(0, steps - 1))
+
+            # Compute the best next edge to add to the tree according to the oracle
+            oracle_node = min(tree_nodes, key=lambda x: dist[x])
+            oracle_node_next = prev[oracle_node]
+
+            target_edge_idx = ((frontier.T == torch.LongTensor([oracle_node, oracle_node_next])).sum(
+                1) == 2).nonzero().squeeze(1).item()
+
+            replay_buffer[replay_pointer % REPLAY_SIZE] = (graph, frontier, target_edge_idx)
+            replay_pointer += 1
+
+            # sample batch from replay buffer and backprop
+            if replay_pointer >= BATCH_SIZE:
+                batch_idxs = random.sample(list(np.arange(min(replay_pointer, REPLAY_SIZE))), BATCH_SIZE)
+                batch = [replay_buffer[i] for i in batch_idxs]
+                graph_list = []
+                frontiers = []
+                target_edge_idxs = []
+                for graph, frontier, target_edge_idx in batch:
+                    graph_list.append(graph)
+                    frontiers.append(frontier)
+                    target_edge_idxs.append(target_edge_idx)
+                batch_graph, batch_frontier, batch_target_edge_mask, batch_batch = create_mini_batch(graph_list, frontiers, target_edge_idxs)
+
+                E = model(batch_graph.x, batch_graph.edge_index).squeeze()
+
+                frontier_vals = E[tuple(batch_frontier)]
+                t1 = torch_scatter.scatter_add(frontier_vals * batch_target_edge_mask, index=batch_batch).exp()
+                t2 = torch_scatter.scatter_add(frontier_vals.exp(), index=batch_batch)
+                minibatch_loss = (t1 / t2).log().mean()
+
+                optimizer.zero_grad()
+                minibatch_loss.backward()
+                optimizer.step()
+
+                train_loss += minibatch_loss
+
+                pbar.set_postfix_str(f'Batch loss {minibatch_loss:.5f} Total train loss {train_loss:.5f}')
+
+                if train_loss < best_loss:
+                    best_loss = train_loss
+                    torch.save(model.state_dict(), f'models/{model_name}.pth')
+
+        '''       
+        pbar = tqdm(range(int(math.ceil(len(idxs) / BATCH_SIZE))))
 
         for batch_idx in pbar:
             minibatch = idxs[batch_idx * BATCH_SIZE: min((batch_idx + 1) * BATCH_SIZE, len(idxs))]
@@ -631,7 +719,7 @@ def train(train_path, model_name):
                 oracle_node_next = prev[oracle_node]
 
                 target_edge_idx = ((frontier.T == torch.LongTensor([oracle_node, oracle_node_next])).sum(
-                    1) == 2).nonzero().squeeze(1).item()
+                     1) == 2).nonzero().squeeze(1).item()
                 minibatch_loss += - (E[tuple(frontier)].exp()[target_edge_idx] / E[tuple(frontier)].exp().sum()).log()
                 batch_size += 1
 
@@ -648,6 +736,7 @@ def train(train_path, model_name):
                 best_loss = train_loss
                 torch.save(model.state_dict(), f'models/{model_name}.pth')
 
+        '''
 
 if __name__ == '__main__':
     plt.rcParams['figure.dpi'] = 120
@@ -742,9 +831,7 @@ if __name__ == '__main__':
     env_x = Scatter2D(10, 10, map=world_x)
     env_scatter = Scatter2D(10, 10, map=world_scatter)
 
-    evaluate(env_checker, model1, 100, 123)
-    #evaluate_baseline(env_train, 100, 123)
-    evaluate_rrt(env_checker, 100, 123)
     #make_data('checker_corridor', [env_checker, env_corridor], 500)
-    #train('objs/checker_corridor.pkl', 'model_checker_corridor')
+
+    train('objs/checker_corridor.pkl', 'test')
 
