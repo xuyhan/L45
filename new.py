@@ -296,12 +296,13 @@ def helper(E, env, graph, explore_steps, train_mode=False):
     goal_node = graph.x.shape[0] - 1
 
     tree_nodes.append(start_node)
+    E[:, start_node] = 0
 
     success = False
 
     steps = 0
 
-    for steps in range(explore_steps):
+    for steps in range(1, explore_steps + 1):
         tree_nodes_ = torch.LongTensor(tree_nodes)
 
         us, vs = torch.where(E[tree_nodes_, :] != 0)
@@ -313,6 +314,7 @@ def helper(E, env, graph, explore_steps, train_mode=False):
 
         start, end = tree_nodes[us[top].item()], vs[top].item()
 
+        # TODO: CHECK
         if train_mode or env.not_collide(graph.x[start, :2], graph.x[end, :2]):
             E[:, end] = 0
             tree_nodes.append(end)
@@ -447,7 +449,7 @@ class CustomDataset:
 def make_data():
     dataset = CustomDataset()
     pbar = tqdm(range(1000))
-    env = Scatter2D(10, 10, [0, 0], [10, 10])
+    env = Scatter2D(10, 10)
 
     for _ in pbar:
         while True:
@@ -460,27 +462,30 @@ def make_data():
 
         pbar.set_postfix_str(f'Generating RGGs')
 
-    file = open('objs/train.pkl', 'wb')
+    file = open('objs/train_random_start_end.pkl', 'wb')
     pickle.dump(dataset, file)
 
 
-def train():
+def train(train_path, model_name):
     # device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     model = Model(in_dim=6)  # .to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
     env = Scatter2D(10, 10)
 
-    file = open('objs/train.pkl', 'rb')
+    file = open(train_path, 'rb')
     dataset = pickle.load(file)
+    file.close()
 
     idxs = list(np.arange(dataset.len()))
 
-    for epoch in range(200):
+    for epoch in range(30):
         random.shuffle(idxs)
 
         pbar = tqdm(range(int(math.ceil(len(idxs) / BATCH_SIZE))))
         train_loss = 0
+
+        best_loss = float('inf')
 
         for batch_idx in pbar:
             minibatch = idxs[batch_idx * BATCH_SIZE: min((batch_idx + 1) * BATCH_SIZE, len(idxs))]
@@ -497,7 +502,7 @@ def train():
                 _, _, _, success, steps = helper(torch.clone(E), env, graph, explore_steps=1000000)
                 assert success
                 tree_nodes, tree_edges, frontier, _, _ = helper(torch.clone(E), env, graph,
-                                                                explore_steps=random.randint(1, steps - 1))
+                                                                explore_steps=random.randint(0, steps - 1))
 
                 # Compute the best next edge to add to the tree according to the oracle
                 oracle_node = min(tree_nodes, key=lambda x: dist[x])
@@ -564,11 +569,15 @@ def train():
 
             train_loss += minibatch_loss
             pbar.set_postfix_str(f'Batch loss {minibatch_loss:.5f} Total train loss {train_loss:.5f}')
-            torch.save(model.state_dict(), 'models/new.pth')
+
+            if train_loss < best_loss:
+                best_loss = train_loss
+                torch.save(model.state_dict(), f'models/{model_name}.pth')
 
 
 if __name__ == '__main__':
     plt.rcParams['figure.dpi'] = 120
-    make_data()
+    #train('objs/train_fixed_start_end.pkl', 'model_fixed')
+    train('objs/train_random_start_end.pkl', 'model_random')
 
     #
