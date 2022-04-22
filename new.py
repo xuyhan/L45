@@ -80,6 +80,7 @@ class Env2D:
         self.end = end
 
         self.gen()
+        self.set_start_end()
 
     def gen(self):
         raise NotImplementedError()
@@ -157,6 +158,13 @@ class Env2D:
 
         return graph, adj_list, costs, opt_path, dist, prev
 
+    def set_start_end(self):
+        while True:
+            start = torch.rand(2) * torch.tensor([self.width, self.height])
+            end = torch.rand(2) * torch.tensor([self.width, self.height])
+            if self.not_in_obstacle(start) and self.not_in_obstacle(end):
+                break
+
     def start_end_seeded(self, n, s):
         torch.random.manual_seed(s)
         ret = []
@@ -175,32 +183,22 @@ class Env2D:
     def rand_position(self):
         return torch.rand(2) * torch.tensor([self.width, self.height])
 
-    def rgg(self, start_end=None, force_path=False):
-        if start_end is not None:
-            start = torch.tensor(start_end[0])
-            end = torch.tensor(start_end[1])
-        else:
-            while True:
-                start = torch.rand(2) * torch.tensor([self.width, self.height])
-                end = torch.rand(2) * torch.tensor([self.width, self.height])
-                if self.not_in_obstacle(start) and self.not_in_obstacle(end):
-                    break
-
+    def rgg(self, force_path=False):
         while True:
-            graph = self._rgg(start, end)
+            graph = self._rgg()
             graph, adj_list, costs, opt_path, dist, prev = self.graph_properties(graph)
             if opt_path == [] and force_path:
                 continue
             return self, graph, adj_list, costs, opt_path, dist, prev
 
-    def _rgg(self, start, end):
+    def _rgg(self):
         rgg_size = self.n_samples + 2
 
         r = torch.rand((self.n_samples, 2)) * torch.tensor([self.width, self.height])  # [[x1,y1],[x2,y2],...,[xn,yn]]
 
-        r = torch.row_stack([r, start, end])
+        r = torch.row_stack([r, self.start, self.end])
 
-        l2 = (r - end).pow(2).sum(dim=1)
+        l2 = (r - self.end).pow(2).sum(dim=1)
         r = torch.column_stack([r, l2])
 
         # check if each point is in free space or obstacle or goal
@@ -446,21 +444,20 @@ def tree_to_path(adj_list, nodes, pos, src, dst):
     return list(path), dist[src]
 
 
-def evaluate(env, model, n_instances, seed):
+def evaluate(envs, model):
     success_count = 0
     running_time_total = 0
     path_cost_total = 0
+    n_instances = len(envs)
 
-    start_end = env.start_end_seeded(n_instances, s=seed)
-
-    for se in tqdm(start_end):
+    for env_instance in tqdm(envs):
         time_start = time.time()
 
         success = False
         tries = 0
 
         while not success and tries < 6:
-            graph = env._rgg(torch.tensor(se[0]), torch.tensor(se[1]))
+            graph = env_instance._rgg()
             E = model(graph.x, graph.edge_index).squeeze()  # [n_nodes, n_nodes]
             tree_nodes, tree_edges, frontier, success, steps = helper(E, env, graph, 1000)
             tries += 1
@@ -487,17 +484,16 @@ def evaluate(env, model, n_instances, seed):
     print(f'Average cost: {path_cost_total / success_count : .3f}')
 
 
-def evaluate_baseline(env, n_instances, seed):
+def evaluate_baseline(envs):
     success_count = 0
     running_time_total = 0
     path_cost_total = 0
+    n_instances = len(envs)
 
-    start_end = env.start_end_seeded(n_instances, s=seed)
-
-    for se in tqdm(start_end):
+    for env_instance in tqdm(envs):
         time_start = time.time()
 
-        _, graph, adj_list, costs, opt_path, dist, prev = env.rgg(force_path=True, start_end=se)
+        _, graph, adj_list, costs, opt_path, dist, prev = env_instance.rgg(force_path=True)
 
         if opt_path != []:
             success_count += 1
@@ -510,20 +506,20 @@ def evaluate_baseline(env, n_instances, seed):
     print(f'Average cost: {path_cost_total / success_count : .3f}')
 
 
-def evaluate_rrt(env, n_instances, seed):
+def evaluate_rrt(envs):
     success_count = 0
     running_time_total = 0
     path_cost_total = 0
+    n_instances = len(envs)
 
-    start_end = env.start_end_seeded(n_instances, s=seed)
     max_iters = 2000
     eps = 0.3
 
-    for se in tqdm(start_end):
+    for env_instance in tqdm(envs):
         time_start = time.time()
 
-        start_pos = np.array(se[0])
-        end_pos = np.array(se[1])
+        start_pos = np.array(env_instance.start)
+        end_pos = np.array(env_instance.end)
 
         adj_list = defaultdict(list)
         positions = [start_pos]
@@ -532,7 +528,7 @@ def evaluate_rrt(env, n_instances, seed):
         success = False
 
         for _ in range(max_iters):
-            rand_pos = env.rand_position().numpy()
+            rand_pos = env_instance.rand_position().numpy()
             nearest = min(nodes, key=lambda n: np.linalg.norm(positions[n] - rand_pos))
             vec = rand_pos - positions[nearest]
             norm = np.linalg.norm(vec)
@@ -540,7 +536,7 @@ def evaluate_rrt(env, n_instances, seed):
             delta = min(eps, norm)
             new_node_pos = positions[nearest] + delta * unit
 
-            if env.intersects(new_node_pos, positions[nearest]):
+            if env_instance.intersects(new_node_pos, positions[nearest]):
                 continue
 
             new_node = nodes[-1] + 1
