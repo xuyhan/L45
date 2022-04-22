@@ -19,7 +19,7 @@ import torch_scatter
 TAU = 50
 N_SAMPLES = 200
 K = 10
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 REPLAY_SIZE = 1024
 N_OBSTACLES = 6
 
@@ -69,7 +69,7 @@ class Model(torch.nn.Module):
 
 
 class Env2D:
-    def __init__(self, width, height, start=None, end=None):
+    def __init__(self, width, height, start=None, end=None, force_dist=0):
         self.width = width
         self.height = height
         self.obstacles = set()
@@ -79,6 +79,7 @@ class Env2D:
 
         self.start = start
         self.end = end
+        self.force_dist = force_dist
 
         self.gen()
         self.set_start_end()
@@ -163,6 +164,8 @@ class Env2D:
         while True:
             self.start = torch.rand(2) * torch.tensor([self.width, self.height])
             self.end = torch.rand(2) * torch.tensor([self.width, self.height])
+            if (self.start - self.end).pow(2).sum().pow(0.5) < self.force_dist:
+                continue
             if self.not_in_obstacle(self.start) and self.not_in_obstacle(self.end):
                 break
 
@@ -276,10 +279,10 @@ class Env2D:
 
 
 class Scatter2D(Env2D):
-    def __init__(self, *args, map=None, p=0.1):
+    def __init__(self, *args, map=None, p=0.1, **kwargs):
         self.p = p
 
-        super().__init__(*args)
+        super().__init__(*args, **kwargs)
         if map is not None:
             self.obstacles = set()
             map = torch.tensor(map).reshape((self.height, self.width)).flip(0)
@@ -519,8 +522,8 @@ def evaluate_rrt(evaluation_dataset):
     path_cost_total = 0
     n_instances = len(envs)
 
-    max_iters = 800
-    eps = 0.5
+    max_iters = 1000
+    eps = 0.3
 
     for env_instance in tqdm(envs):
         time_start = time.time()
@@ -811,6 +814,9 @@ if __name__ == '__main__':
     model3 = Model(in_dim=6)
     model3.load_state_dict(torch.load('models/fast-10-epoch.pth'))
 
+    model4 = Model(in_dim=6)
+    model4.load_state_dict(torch.load('models/fast-epochs=10-buffer=1024-batch=32.pth'))
+
     model_base = Model(in_dim=6)
     model_base.load_state_dict(torch.load('models/model_random.pth'))
 
@@ -901,19 +907,19 @@ if __name__ == '__main__':
     #envs_train = [Scatter2D(10, 10, p=0.08) for _ in range(1000)]
     #make_data('scatter_random_n=200_k=10_s=1000', envs_train)
 
-    if True:
-        evaluation_dataset = EvaluationDataset([Scatter2D(10, 10, p=0.3) for _ in range(1000)])
+    if False:
+        evaluation_dataset = EvaluationDataset([Scatter2D(10, 10, force_dist=0, p=0.08) for _ in range(1000)])
 
         #evaluate(evaluation_dataset, model)
         #evaluate(evaluation_dataset, model1)
-        #evaluate(evaluation_dataset, model2)
-        #evaluate(evaluation_dataset, model3)
+        evaluate(evaluation_dataset, model3)
+        evaluate(evaluation_dataset, model4)
         evaluate_rrt(evaluation_dataset)
 
     #train('objs/scatter_random_n=200_k=10_s=1000.pkl', 'slow', 30, fast=False)
     #train('objs/scatter_random_n=200_k=10_s=1000.pkl', 'fast-1-epoch', 1, fast=True)
     #train('objs/scatter_random_n=200_k=10_s=1000.pkl', 'fast-5-epoch', 5, fast=True)
-    #train('objs/scatter_random_n=200_k=10_s=1000.pkl', 'fast-10-epoch', 10, fast=True)
+    train('objs/scatter_random_n=200_k=10_s=1000.pkl', 'fast-epochs=50-buffer=1024-batch=64', 32, fast=True)
 
 
 #%%
