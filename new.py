@@ -15,13 +15,17 @@ import time
 import heapq
 import pickle
 import torch_scatter
+from envs import *
 
 TAU = 50
-N_SAMPLES = 200
-K = 10
-BATCH_SIZE = 16
+N_SAMPLES = 100 #200
+K = 7 #7
+BATCH_SIZE = 32
 REPLAY_SIZE = 1024
 N_OBSTACLES = 6
+
+TRAIN_SET = 'scatter_random_n=200_k=10_p=0.08_s=1000'
+
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
@@ -67,276 +71,6 @@ class Model(torch.nn.Module):
         E[tuple(edge_index)] += x
         return E
 
-
-class Env2D:
-    def __init__(self, width, height, start=None, end=None, force_dist=0):
-        self.width = width
-        self.height = height
-        self.obstacles = set()
-
-        self.k = K
-        self.n_samples = N_SAMPLES
-
-        self.start = start
-        self.end = end
-        self.force_dist = force_dist
-
-        self.gen()
-        self.set_start_end()
-
-    def gen(self):
-        raise NotImplementedError()
-
-    def not_in_obstacle(self, pos):
-        for obs_x, obs_y in self.obstacles:
-            ox0 = obs_x
-            ox1 = obs_x + 1
-            oy0 = obs_y
-            oy1 = obs_y + 1
-            if ox0 <= pos[0] <= ox1 and oy0 <= pos[1] <= oy1:
-                return False
-        return True
-
-    def not_collide(self, pos1, pos2):
-        return not self.intersects(pos1.cpu().numpy(), pos2.cpu().numpy())
-
-    def intersects(self, pos1, pos2):
-        x0, y0 = pos1
-        x1, y1 = pos2
-
-        if abs(x1 - x0) < 10e-5:
-            for obs_x, obs_y in self.obstacles:
-                oy0 = obs_y
-                oy1 = obs_y + 1
-                if y1 >= oy0 and y0 <= oy1 or oy1 >= y0 and oy0 <= y1:
-                    return True
-            return False
-
-        if x1 < x0:
-            x0, x1 = x1, x0
-            y0, y1 = y1, y0
-
-        m = (y1 - y0) / (x1 - x0)
-        c = y0 - m * x0
-
-        for obs_x, obs_y in self.obstacles:
-            ox0 = obs_x
-            ox1 = obs_x + 1
-            oy0 = obs_y
-            oy1 = obs_y + 1
-
-            if not (x1 >= ox0 and x0 <= ox1 or ox1 >= x0 and ox0 <= x1):
-                continue
-
-            p = m * ox0 + c
-            q = m * ox1 + c
-
-            if oy0 <= p <= oy1 or oy0 <= q <= oy1:
-                return True
-
-            if p < oy0 and oy1 < q or p > oy0 and oy1 > q:
-                return True
-
-        return False
-
-    def graph_properties(self, graph):
-        adj_list = defaultdict(list)
-        for [u, v] in graph.edge_index.T:
-            adj_list[u.item()].append(v.item())
-        start_node = graph.x.shape[0] - 2
-        goal_node = graph.x.shape[0] - 1
-
-        costs = {}
-        pos = graph.x[:, :2]
-        for node in range(graph.x.shape[0]):
-            for nb in adj_list[node]:
-                if self.not_collide(pos[nb], pos[node]):
-                    dist = (pos[nb] - pos[node]).pow(2).sum().pow(0.5).item()
-                else:
-                    dist = float('inf')
-                costs[(node, nb)] = dist
-
-        opt_path, dist, prev = dijkstra(adj_list, costs, start_node, goal_node)
-
-        return graph, adj_list, costs, opt_path, dist, prev
-
-    def set_start_end(self):
-        while True:
-            self.start = torch.rand(2) * torch.tensor([self.width, self.height])
-            self.end = torch.rand(2) * torch.tensor([self.width, self.height])
-            if (self.start - self.end).pow(2).sum().pow(0.5) < self.force_dist:
-                continue
-            if self.not_in_obstacle(self.start) and self.not_in_obstacle(self.end):
-                break
-
-    def start_end_seeded(self, n, s):
-        torch.random.manual_seed(s)
-        ret = []
-        for _ in range(n):
-            while True:
-                start = torch.rand(2) * torch.tensor([self.width, self.height])
-                end = torch.rand(2) * torch.tensor([self.width, self.height])
-                if self.not_in_obstacle(start) and self.not_in_obstacle(end):
-                    break
-            ret.append([
-                list(start.numpy()),
-                list(end.numpy())
-            ])
-        return ret
-
-    def rand_position(self):
-        return torch.rand(2) * torch.tensor([self.width, self.height])
-
-    def rgg(self, force_path=False):
-        while True:
-            graph = self._rgg()
-            graph, adj_list, costs, opt_path, dist, prev = self.graph_properties(graph)
-            if opt_path == [] and force_path:
-                continue
-            return self, graph, adj_list, costs, opt_path, dist, prev
-
-    def _rgg(self):
-        rgg_size = self.n_samples + 2
-
-        r = torch.rand((self.n_samples, 2)) * torch.tensor([self.width, self.height])  # [[x1,y1],[x2,y2],...,[xn,yn]]
-
-        r = torch.row_stack([r, self.start, self.end])
-
-        l2 = (r - self.end).pow(2).sum(dim=1)
-        r = torch.column_stack([r, l2])
-
-        # check if each point is in free space or obstacle or goal
-        one_hot = []
-        for idx, [x, y] in enumerate(r[:, :2].floor().long()):
-            if idx == r.shape[0] - 1:
-                one_hot.append([0, 0, 1])
-            elif (x.item(), y.item()) in self.obstacles:
-                one_hot.append([0, 1, 0])
-            else:
-                one_hot.append([1, 0, 0])
-        r = torch.column_stack([r, torch.tensor(one_hot)])
-
-        D = (r[:, 0][:, None] - r[:, 0].repeat(rgg_size, 1)).pow(2) + (
-                    r[:, 1][:, None] - r[:, 1].repeat(rgg_size, 1)).pow(2)
-        D += torch.eye(rgg_size) * (2 ** 20)
-        knn = D.argsort(dim=1)[:, :self.k]
-
-        us = torch.arange(rgg_size).repeat(1, self.k).squeeze()
-        vs = knn.T.reshape(-1, 1).squeeze()
-
-        edge_index = to_undirected(torch.row_stack([us, vs]))
-        return Data(x=r, edge_index=edge_index)
-
-    def visualise(self, graph, special_edges=torch.LongTensor([]), frontier_edges=torch.LongTensor([]),
-                  oracle_edge=None, opt_path=None):
-        pos = graph.x[:, :2].detach().cpu().numpy()
-        px_free = [x for idx, [x, y] in enumerate(pos) if graph.x[idx, 3] == 1]
-        py_free = [y for idx, [x, y] in enumerate(pos) if graph.x[idx, 3] == 1]
-
-        px_collide = [x for idx, [x, y] in enumerate(pos) if graph.x[idx, 4] == 1]
-        py_collide = [y for idx, [x, y] in enumerate(pos) if graph.x[idx, 4] == 1]
-
-        fig, ax = plt.subplots()
-
-        for x, y in self.obstacles:
-            rect = plt.Rectangle((x, y), 1, 1, color='purple')
-            ax.add_artist(rect)
-
-        ax.scatter(px_free, py_free, c='lime', alpha=0.5)
-        ax.scatter(px_collide, py_collide, c='red')
-
-        us, vs = graph.edge_index
-        lines = [(pos[us[i].item()], pos[vs[i].item()]) for i in range(graph.edge_index.shape[1])]
-        lc = matplotlib.collections.LineCollection(lines, colors='green', linewidths=2, alpha=0.2)
-        ax.add_collection(lc)
-
-        if opt_path:
-            path_lines = []
-            for u, v in opt_path:
-                path_lines.append((pos[u], pos[v]))
-            lc2 = matplotlib.collections.LineCollection(path_lines, colors='blue', linewidths=6)
-            ax.add_collection(lc2)
-
-        lines = [(pos[u.item()], pos[v.item()]) for [u, v] in special_edges.T]
-        lc = matplotlib.collections.LineCollection(lines, colors='magenta', linewidths=3)
-        ax.add_collection(lc)
-
-        lines = [(pos[u.item()], pos[v.item()]) for [u, v] in frontier_edges.T]
-        lc = matplotlib.collections.LineCollection(lines, colors='cyan', linewidths=3, alpha=0.5)
-        ax.add_collection(lc)
-
-        if oracle_edge is not None:
-            lines = [(pos[oracle_edge[0].item()], pos[oracle_edge[1].item()])]
-            lc = matplotlib.collections.LineCollection(lines, colors='yellow', linewidths=6)
-            ax.add_collection(lc)
-
-        ax.scatter([pos[-2, 0]], [pos[-2, 1]], marker='s', s=120, c='gold', zorder=2)
-        ax.scatter([pos[-1, 0]], [pos[-1, 1]], marker='*', s=250, c='gold', zorder=2)
-
-        ax.autoscale()
-        ax.margins(0.1)
-        plt.show()
-
-
-class Scatter2D(Env2D):
-    def __init__(self, *args, map=None, p=0.1, **kwargs):
-        self.p = p
-
-        super().__init__(*args, **kwargs)
-        if map is not None:
-            self.obstacles = set()
-            map = torch.tensor(map).reshape((self.height, self.width)).flip(0)
-            for i in range(len(map)):
-                for j in range(len(map[0])):
-                    if map[i][j] == 1:
-                        self.obstacles.add((j, i))
-
-    def gen(self):
-        while True:
-            a = torch.rand((self.height, self.width))
-            a = (a < self.p).long()
-            num_free = np.prod(a.shape) - a.sum()
-            if num_free == 0:
-                continue
-            b = torch.nn.functional.pad(a, [1, 1, 1, 1], value=1)
-            i = j = 0
-            for i in range(b.shape[0]):
-                f = False
-                for j in range(b.shape[1]):
-                    if b[i, j] == 0:
-                        f = True
-                        break
-                if f:
-                    break
-            count = 0
-            stack = [(i, j)]
-            b[i, j] = 1
-
-            while stack != []:
-                i, j = stack.pop()
-                count += 1
-                if b[i - 1, j] == 0:
-                    stack.append((i - 1, j))
-                    b[i - 1, j] = 1
-                if b[i + 1, j] == 0:
-                    stack.append((i + 1, j))
-                    b[i + 1, j] = 1
-                if b[i, j - 1] == 0:
-                    stack.append((i, j - 1))
-                    b[i, j - 1] = 1
-                if b[i, j + 1] == 0:
-                    stack.append((i, j + 1))
-                    b[i, j + 1] = 1
-
-            if count == num_free:
-                for x in range(self.width):
-                    for y in range(self.height):
-                        if a[y, x] == 1:
-                            self.obstacles.add((x, y))
-                break
-
-
-
 def dijkstra(adj_list, costs, src, dst):
     nodes = list(adj_list.keys())
     dist = {node: float('inf') for node in nodes}
@@ -364,7 +98,7 @@ def dijkstra(adj_list, costs, src, dst):
     return list(path), dist, prev
 
 
-def helper(E, env, graph, explore_steps, train_mode=False):
+def helper(E, env, graph, explore_steps, train_mode=False, rnd=False):
     tree_nodes = []
     tree_edges = []
 
@@ -386,12 +120,15 @@ def helper(E, env, graph, explore_steps, train_mode=False):
         if us.shape[0] == 0:
             break
 
-        top = E[tree_nodes_[us], vs].argmax()
+        if not rnd:
+            top = E[tree_nodes_[us], vs].argmax()
+        else:
+            top = random.randint(0, us.shape[0] - 1)
 
         start, end = tree_nodes[us[top].item()], vs[top].item()
 
         # TODO: CHECK
-        if train_mode or env.not_collide(graph.x[start, :2], graph.x[end, :2]):
+        if env.not_collide(graph.x[start, :env.n_degrees], graph.x[end, :env.n_degrees]):
             E[:, end] = 0
             tree_nodes.append(end)
             tree_edges.append([start, end])
@@ -448,24 +185,24 @@ def tree_to_path(adj_list, nodes, pos, src, dst):
     return list(path), dist[src]
 
 
-def evaluate(evaluation_dataset, model):
-    envs = evaluation_dataset.envs
-
+def evaluate(env, env_data, model, rnd=False):
     success_count = 0
     running_time_total = 0
     path_cost_total = 0
-    n_instances = len(envs)
+    n_instances = len(env_data)
 
-    for env_instance in tqdm(envs):
+    for env_data_ in tqdm(env_data):
         time_start = time.time()
 
         success = False
         tries = 0
 
+        env.load_data(env_data_)
+
         while not success and tries < 3:
-            graph = env_instance._rgg()
+            graph = env._rgg()
             E = model(graph.x, graph.edge_index).squeeze()  # [n_nodes, n_nodes]
-            tree_nodes, tree_edges, frontier, success, steps = helper(E, env_instance, graph, 1000)
+            tree_nodes, tree_edges, frontier, success, steps = helper(E, env, graph, 1000, rnd=rnd)
             tries += 1
 
         if not success:
@@ -514,18 +251,20 @@ def evaluate_baseline(evaluation_dataset):
     print(f'Average cost: {path_cost_total / success_count : .3f}')
 
 
-def evaluate_rrt(evaluation_dataset):
-    envs = evaluation_dataset.envs
-
+def evaluate_rrt(env_instance, env_data):
     success_count = 0
     running_time_total = 0
     path_cost_total = 0
-    n_instances = len(envs)
+    n_instances = len(env_data)
 
-    max_iters = 1000
+    max_iters = 5000
     eps = 0.3
 
-    for env_instance in tqdm(envs):
+    pbar = tqdm(env_data)
+
+    for env_data_ in pbar:
+        env_instance.load_data(env_data_)
+
         time_start = time.time()
 
         start_pos = np.array(env_instance.start)
@@ -537,8 +276,12 @@ def evaluate_rrt(evaluation_dataset):
 
         success = False
 
+        closest = float('inf')
+        closest_v = None
+
         for _ in range(max_iters):
             rand_pos = env_instance.rand_position().numpy()
+
             nearest = min(nodes, key=lambda n: np.linalg.norm(positions[n] - rand_pos))
             vec = rand_pos - positions[nearest]
             norm = np.linalg.norm(vec)
@@ -546,8 +289,8 @@ def evaluate_rrt(evaluation_dataset):
             delta = min(eps, norm)
             new_node_pos = positions[nearest] + delta * unit
 
-            if env_instance.intersects(new_node_pos, positions[nearest]):
-                continue
+            #if not env_instance.not_collide(torch.tensor(new_node_pos), torch.tensor(positions[nearest])):
+            #    continue
 
             new_node = nodes[-1] + 1
             nodes.append(new_node)
@@ -555,7 +298,13 @@ def evaluate_rrt(evaluation_dataset):
 
             adj_list[new_node].append(nearest)
 
-            if np.linalg.norm(new_node_pos - end_pos) < eps:
+            d = np.linalg.norm(new_node_pos - end_pos)
+
+            if d < closest:
+                closest = d
+                closest_v = new_node_pos
+
+            if d < eps:
                 new_node = nodes[-1] + 1
                 nodes.append(new_node)
                 positions.append(end_pos)
@@ -564,6 +313,8 @@ def evaluate_rrt(evaluation_dataset):
 
             if success:
                 break
+
+        pbar.set_postfix_str(f'Iterations: {max_iters} Success: {success} Closest: {new_node_pos} End: {end_pos}')
 
         if not success:
             continue
@@ -605,11 +356,8 @@ class CustomDataset:
         self.env_mapping = {}
         self.envs = []
 
-    def add_example(self, env, graph, adj_list, costs, opt_path, dist, prev):
-        self.instances.append((graph, adj_list, costs, opt_path, dist, prev))
-        if env not in self.envs:
-            self.envs.append(env)
-        self.env_mapping[self.len() - 1] = self.envs.index(env)
+    def add_example(self, env_data, graph, adj_list, costs, opt_path, dist, prev):
+        self.instances.append((env_data, graph, adj_list, costs, opt_path, dist, prev))
 
     def get(self, i):
         return self.instances[i]
@@ -617,22 +365,20 @@ class CustomDataset:
     def len(self):
         return len(self.instances)
 
-    def get_env(self, i):
-        return self.envs[self.env_mapping[i]]
-
 
 class EvaluationDataset:
     def __init__(self, envs):
         self.envs = envs
 
 
-def make_data(name, envs):
+def make_data(name, env, n_instances):
     dataset = CustomDataset()
-    pbar = tqdm(range(len(envs)))
+    pbar = tqdm(range(n_instances))
 
-    for idx in pbar:
-        dataset.add_example(*envs[idx].rgg(force_path=True))
+    for _ in pbar:
+        dataset.add_example(*env.rgg(force_path=True))
         pbar.set_postfix_str(f'Generating RGGs')
+        env.reset()
 
     file = open(f'objs/{name}.pkl', 'wb')
     pickle.dump(dataset, file)
@@ -664,9 +410,13 @@ def create_mini_batch(graph_list, frontiers, target_edges):
     return batch_graph, batch_frontiers, batch_target_edges, batch_frontier_batch
 
 
+def train(train_path, model_name, epochs=100, fast=False, mode='2d'):
+    if mode == '2d':
+        env = Scatter2D(width=10, height=10)
+    elif mode == '6d':
+        env = RobotEnv()
 
-def train(train_path, model_name, epochs=100, fast=False):
-    model = Model(in_dim=6).to(device)
+    model = Model(in_dim=4 + env.n_degrees).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
     file = open(train_path, 'rb')
@@ -690,8 +440,9 @@ def train(train_path, model_name, epochs=100, fast=False):
             pbar = tqdm(idxs)
 
             for idx in pbar:
-                graph, adj_list, costs, opt_path, dist, prev = dataset.get(idx)
-                env = dataset.get_env(idx)
+                env_data, graph, adj_list, costs, opt_path, dist, prev = dataset.get(idx)
+
+                env.load_data(env_data)
 
                 with torch.no_grad():
                     graph = Data(graph.x.to(device), graph.edge_index.to(device))
@@ -700,7 +451,7 @@ def train(train_path, model_name, epochs=100, fast=False):
                     _, _, _, success, steps = helper(torch.clone(E), env, graph, explore_steps=1000000)
                     assert success
                     tree_nodes, tree_edges, frontier, _, _ = helper(torch.clone(E), env, graph,
-                                                                    explore_steps=random.randint(0, steps - 1))
+                                                                    explore_steps=random.randint(0, steps - 1), train_mode=True)
 
                     frontier = frontier.to(device)
 
@@ -725,6 +476,9 @@ def train(train_path, model_name, epochs=100, fast=False):
                         graph_list.append(graph)
                         frontiers.append(frontier)
                         target_edges.append(target_edge)
+
+                    #print(target_edges)
+
                     batch_graph, batch_frontier, batch_target_edges, batch_frontier_batch = create_mini_batch(graph_list, frontiers, target_edges)
 
                     batch_target_edges = batch_target_edges.to(device)
@@ -762,8 +516,8 @@ def train(train_path, model_name, epochs=100, fast=False):
                 batch_size = 0
 
                 for instance in minibatch:
-                    graph, adj_list, costs, opt_path, dist, prev = dataset.get(instance)
-                    env = dataset.get_env(instance)
+                    env_data, graph, adj_list, costs, opt_path, dist, prev = dataset.get(instance)
+                    env.load_data(env_data)
 
                     # start_time = time.process_time()
                     E = model(graph.x.to(device), graph.edge_index.to(device)).squeeze().cpu() # [n_nodes, n_nodes]
@@ -771,7 +525,7 @@ def train(train_path, model_name, epochs=100, fast=False):
                     _, _, _, success, steps = helper(torch.clone(E), env, graph, explore_steps=1000000)
                     assert success
                     tree_nodes, tree_edges, frontier, _, _ = helper(torch.clone(E), env, graph,
-                                                                    explore_steps=random.randint(0, steps - 1))
+                                                                    explore_steps=random.randint(0, steps - 1), train_mode=True)
 
                     # Compute the best next edge to add to the tree according to the oracle
                     oracle_node = min(tree_nodes, key=lambda x: dist[x])
@@ -799,127 +553,152 @@ def train(train_path, model_name, epochs=100, fast=False):
                     torch.save(model.state_dict(), f'models/{model_name}.pth')
 
 
-if __name__ == '__main__':
-    plt.rcParams['figure.dpi'] = 120
-    plt.rcParams['figure.figsize'] = (6, 6)
+def test_rgg():
+    env_2d = Scatter2D(width=10, height=10, p=0.08)
+    env_data, graph, adj_list, costs, opt_path, dist, prev = env_2d.rgg(force_path=True)
 
     model = Model(in_dim=6)
+    model.load_state_dict(torch.load('models/fast-epochs=10-buffer=1024-batch=32.pth'))
 
-    model1 = Model(in_dim=6)
-    model1.load_state_dict(torch.load('models/fast-1-epoch.pth'))
+    E = model(graph.x, graph.edge_index).squeeze()  # [n_nodes, n_nodes]
+    tree_nodes, tree_edges, frontier, success, steps = helper(E, env_2d, graph, 1000)
+    oracle_node = min(tree_nodes, key=lambda x: dist[x])
+    oracle_node_next = prev[oracle_node]
+    oracle_edge = None
+
+    if oracle_node_next:
+        oracle_edge = torch.LongTensor([oracle_node, oracle_node_next])
+
+    env_2d.visualise(graph, special_edges=tree_edges, frontier_edges=frontier, oracle_edge=oracle_edge, opt_path=opt_path)
+
+
+
+def train_2d():
+    #test_rgg()
+    #exit(0)
+
+    model = Model(in_dim=6)
+    model.load_state_dict(torch.load('models/good.pth'))
 
     model2 = Model(in_dim=6)
-    model2.load_state_dict(torch.load('models/fast-5-epoch.pth'))
-
-    model3 = Model(in_dim=6)
-    model3.load_state_dict(torch.load('models/fast-10-epoch.pth'))
-
-    model4 = Model(in_dim=6)
-    model4.load_state_dict(torch.load('models/fast-epochs=10-buffer=1024-batch=32.pth'))
+    model2.load_state_dict(torch.load('models/fast-epochs=10-buffer=1024-batch=32.pth'))
 
     model_base = Model(in_dim=6)
     model_base.load_state_dict(torch.load('models/model_random.pth'))
 
-    world_empty = [
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    ]
+    # world_empty = [
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    # ]
+    #
+    # world_basic = [
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #     0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+    #     0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+    #     0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+    #     0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+    #     0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+    #     0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+    #     0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+    # ]
+    #
+    # world_checker = [
+    #     1, 0, 1, 0, 1, 0, 1, 0, 1, 0,
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #     1, 0, 1, 0, 1, 0, 1, 0, 1, 0,
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #     1, 0, 1, 0, 1, 0, 1, 0, 1, 0,
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #     1, 0, 1, 0, 1, 0, 1, 0, 1, 0,
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #     1, 0, 1, 0, 1, 0, 1, 0, 1, 0,
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    # ]
+    #
+    # world_x = [
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #     0, 1, 0, 0, 0, 0, 0, 0, 1, 0,
+    #     0, 0, 1, 0, 0, 0, 0, 1, 0, 0,
+    #     0, 0, 0, 1, 0, 0, 1, 0, 0, 0,
+    #     0, 0, 0, 0, 1, 1, 0, 0, 0, 0,
+    #     0, 0, 0, 0, 1, 1, 0, 0, 0, 0,
+    #     0, 0, 0, 1, 0, 0, 1, 0, 0, 0,
+    #     0, 0, 1, 0, 0, 0, 0, 1, 0, 0,
+    #     0, 1, 0, 0, 0, 0, 0, 0, 1, 0,
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    # ]
+    #
+    # world_corridor = [
+    #     0, 1, 0, 0, 0, 1, 0, 0, 0, 1,
+    #     0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+    #     0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+    #     0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+    #     0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+    #     0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+    #     0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+    #     0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+    #     0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+    #     0, 0, 0, 1, 0, 0, 0, 1, 0, 0,
+    # ]
+    #
+    # world_scatter = [
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #     0, 1, 0, 0, 0, 0, 1, 0, 0, 1,
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #     0, 0, 0, 1, 0, 0, 1, 0, 0, 0,
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    #     0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+    #     0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+    #     0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
+    #     0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+    #     0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+    # ]
 
-    world_basic = [
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-    ]
+    #make_data(TRAIN_SET, Scatter2D(width=10, height=10, p=0.08), 1000)
+    #train(f'objs/{TRAIN_SET}.pkl', 'good', 10, fast=True)
 
-    world_checker = [
-        1, 0, 1, 0, 1, 0, 1, 0, 1, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        1, 0, 1, 0, 1, 0, 1, 0, 1, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        1, 0, 1, 0, 1, 0, 1, 0, 1, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        1, 0, 1, 0, 1, 0, 1, 0, 1, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        1, 0, 1, 0, 1, 0, 1, 0, 1, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    ]
+    env_eval = Scatter2D(width=10, height=10, force_dist=5, p=0.16)
+    env_data = []
+    for _ in range(1000):
+        env_eval.reset()
+        env_data.append(env_eval.get_data())
+    evaluate(env_eval, env_data, model, rnd=True)
+    evaluate(env_eval, env_data, model)
+    evaluate_rrt(env_eval, env_data)
 
-    world_x = [
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 1, 0, 0, 0, 0, 0, 0, 1, 0,
-        0, 0, 1, 0, 0, 0, 0, 1, 0, 0,
-        0, 0, 0, 1, 0, 0, 1, 0, 0, 0,
-        0, 0, 0, 0, 1, 1, 0, 0, 0, 0,
-        0, 0, 0, 0, 1, 1, 0, 0, 0, 0,
-        0, 0, 0, 1, 0, 0, 1, 0, 0, 0,
-        0, 0, 1, 0, 0, 0, 0, 1, 0, 0,
-        0, 1, 0, 0, 0, 0, 0, 0, 1, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    ]
+def train_6d():
+    #make_data('robots-300', RobotEnv(), n_instances=300)
+    #train(f'objs/robots-300.pkl', 'robot', 300, fast=True, mode='6d')
 
-    world_corridor = [
-        0, 1, 0, 0, 0, 1, 0, 0, 0, 1,
-        0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
-        0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
-        0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
-        0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
-        0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
-        0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
-        0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
-        0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
-        0, 0, 0, 1, 0, 0, 0, 1, 0, 0,
-    ]
+    model = Model(in_dim=4 + 6)
+    model.load_state_dict(torch.load('models/robot.pth'))
 
-    world_scatter = [
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 1, 0, 0, 0, 0, 1, 0, 0, 1,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 1, 0, 0, 1, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-        0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-        0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-    ]
+    env_eval = RobotEnv()
+    env_data = []
+    for _ in range(100):
+        env_eval.reset()
+        env_data.append(env_eval.get_data())
 
-    # env_train = Scatter2D(10, 10, map=world_basic)
-    # env_checker = Scatter2D(10, 10, map=world_checker)
-    # env_corridor = Scatter2D(10, 10, map=world_corridor)
-    # env_x = Scatter2D(10, 10, map=world_x)
-    #env_scatter = Scatter2D(10, 10, map=world_scatter)
+    #evaluate(env_eval, env_data, model, rnd=True)
+    #evaluate(env_eval, env_data, model)
+    evaluate_rrt(env_eval, env_data)
 
-    #envs_train = [Scatter2D(10, 10, p=0.08) for _ in range(1000)]
-    #make_data('scatter_random_n=200_k=10_s=1000', envs_train)
+if __name__ == '__main__':
 
-    if False:
-        evaluation_dataset = EvaluationDataset([Scatter2D(10, 10, force_dist=0, p=0.08) for _ in range(1000)])
+    plt.rcParams['figure.dpi'] = 120
+    plt.rcParams['figure.figsize'] = (6, 6)
 
-        #evaluate(evaluation_dataset, model)
-        #evaluate(evaluation_dataset, model1)
-        evaluate(evaluation_dataset, model3)
-        evaluate(evaluation_dataset, model4)
-        evaluate_rrt(evaluation_dataset)
-
-    #train('objs/scatter_random_n=200_k=10_s=1000.pkl', 'slow', 30, fast=False)
-    #train('objs/scatter_random_n=200_k=10_s=1000.pkl', 'fast-1-epoch', 1, fast=True)
-    #train('objs/scatter_random_n=200_k=10_s=1000.pkl', 'fast-5-epoch', 5, fast=True)
-    train('objs/scatter_random_n=200_k=10_s=1000.pkl', 'fast-epochs=50-buffer=1024-batch=64', 32, fast=True)
+    train_6d()
 
 
 #%%
